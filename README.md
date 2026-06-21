@@ -1,18 +1,25 @@
 # Vibe Shortcut
 
-**Vibe Shortcut** is a small Windows floating shortcut panel for AI-assisted workflows. It gives you a frosted-glass touch panel with configurable buttons for voice input, send/enter, and deletion actions.
+## About / 项目定位
 
-**Vibe Shortcut** 是一个面向 Windows 的桌面悬浮快捷键小工具。它在屏幕角落放置一组磨砂玻璃风格的触控按钮，用来快速触发语音输入、发送/回车、删除等高频动作。
+Vibe Shortcut is a Windows floating shortcut panel built for AI-assisted workflows.
 
-This project is especially useful for developers in mainland China who use AI coding/chat tools together with local voice input tools such as WeChat Input Method or 闪电说.
+Vibe Shortcut 是一个为 AI 协作工作流设计的 Windows 悬浮快捷键工具。
 
-本项目主要面向中国大陆的 AI 协作程序员，尤其适合把 ChatGPT/Codex/各类 AI 编程工具与微信输入法、闪电说等语音输入工具组合使用的场景。
+It is for developers and creators who already use ChatGPT, Codex, Cursor, Claude, or similar AI tools heavily, and are moving from “typing everything” to “voice input + a few confirmation actions”. In touch-screen, tablet, remote desktop, standing desk, or commuting scenarios, keyboard and mouse are not always convenient, but actions like starting voice input, sending a prompt, inserting a line break, or deleting text are still very frequent.
+
+它适合已经大量使用 ChatGPT、Codex、Cursor、Claude 等 AI 工具，并开始把工作方式从“长时间敲键盘”转向“语音输入 + 少量确认操作”的程序员和创作者。尤其是在触屏设备、平板、远程桌面、站立办公或通勤场景下，键盘鼠标不总是顺手，但唤起语音输入、发送指令、换行、删除修改这些动作又非常高频。
+
+Vibe Shortcut solves this specific problem by turning the most common AI workflow shortcuts into large, thumb-friendly buttons fixed at the edge of your screen. It is not a voice recognition engine or a complex automation platform. It is a lightweight on-screen shortcut pad for voice input, sending, and deletion.
+
+Vibe Shortcut 解决的就是这个问题：把 AI 协作中最常用的几个快捷键，变成固定在屏幕角落、拇指可以直接点到的悬浮按钮。它不是语音识别引擎，也不是复杂的自动化工具，而是一个轻量的“屏幕快捷键盘”。
 
 ## Features / 功能特性
 
 - Frosted-glass floating panel that stays on top.
-- Configurable round buttons with built-in icons or custom images.
-- Voice mode switcher: long press or right click the voice button to switch between WeChat Input Method and 闪电说.
+- Large round buttons designed for touch-screen use.
+- Configurable shortcuts, built-in icons, and custom button images.
+- Voice mode switcher for tools such as WeChat Input Method and 闪电说.
 - Send button: short press sends `Enter`; long press or right click sends `Ctrl+Enter`.
 - Delete button: short press sends `Backspace`; long press repeats deletion; right click deletes to the beginning of the current input.
 - Windows system tray menu with settings and startup options.
@@ -20,18 +27,25 @@ This project is especially useful for developers in mainland China who use AI co
 - Windows installer and portable build support.
 
 - 磨砂半透明玻璃悬浮面板，支持置顶显示。
-- 圆形按钮可配置快捷键、内置图标或自定义图片。
-- 语音模式切换：长按或右键语音按钮，可在微信输入法和闪电说之间切换。
+- 大号圆形按钮，适合触屏和拇指点击。
+- 每个按钮都可以配置快捷键、图标或图片。
+- 支持微信输入法、闪电说等语音输入快捷键切换。
 - 发送按钮：短按发送 `Enter`，长按或右键发送 `Ctrl+Enter`。
 - 删除按钮：短按发送 `Backspace`，长按连续删除，右键删除到当前输入光标前。
 - 系统托盘菜单提供设置入口和开机自启动选项。
 - 支持 Windows 安装包和便携版打包。
 
-## Screenshot / 截图
+## Who Is It For? / 适合谁
 
-The app is designed as a compact transparent floating widget. Screenshots will be added after the first public release assets are prepared.
+- AI-assisted programmers who use voice input while coding or prompting.
+- Creators who write with AI and frequently switch between speaking, sending, and editing.
+- Touch-screen, tablet, or remote desktop users who want fewer keyboard and mouse interruptions.
+- Developers in mainland China who use AI tools together with local voice input tools.
 
-应用本体是一个紧凑的透明悬浮控件。公开发布截图会在首个 Release 资源整理后补充。
+- 重度使用 AI 编程、AI 写作、AI 对话工具的人。
+- 想用语音输入提高效率，但又不想频繁切回键盘鼠标的人。
+- 使用触屏、平板、远程桌面、站立办公或移动办公场景的人。
+- 把 ChatGPT/Codex/各类 AI 工具与微信输入法、闪电说等语音输入工具组合使用的中国大陆用户。
 
 ## Requirements / 环境要求
 
