@@ -1,0 +1,84 @@
+{
+  "name": "vibe-shortcut",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A frosted-glass floating shortcut panel for touch-first desktop workflows.",
+  "license": "MIT",
+  "author": "Tukuaiji",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Scott-Du/vibe-shortcut.git"
+  },
+  "homepage": "https://github.com/Scott-Du/vibe-shortcut#readme",
+  "bugs": {
+    "url": "https://github.com/Scott-Du/vibe-shortcut/issues"
+  },
+  "keywords": [
+    "electron",
+    "shortcut",
+    "voice-input",
+    "floating-window",
+    "vibe-coding"
+  ],
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"node scripts/start-electron-dev.js\"",
+    "icons": "python scripts/generate-icons.py",
+    "build": "vite build",
+    "start": "node scripts/start-electron-built.js",
+    "package:win": "npm run icons && npm run build && electron-builder --win portable",
+    "package:installer": "npm run icons && npm run build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "electron": "^33.2.1",
+    "electron-builder": "^26.15.3",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.vibeshortcut.app",
+    "productName": "Vibe Shortcut",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets",
+        "to": "assets"
+      }
+    ],
+    "win": {
+      "icon": "assets/desktop-icon.ico",
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "artifactName": "Vibe Shortcut ${version}.exe"
+    },
+    "nsis": {
+      "artifactName": "Vibe Shortcut Setup ${version}.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Vibe Shortcut",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

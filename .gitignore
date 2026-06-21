@@ -1,0 +1,13 @@
+node_modules/
+dist/
+out/
+release/
+*.log
+.vite/
+.env
+.env.*
+*.local
+icon-frame-*.png
+01_行动清单.md
+02_产品文档PRD.md
+03_技术决策文档.md
