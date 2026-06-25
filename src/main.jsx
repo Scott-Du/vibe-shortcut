@@ -4,10 +4,28 @@ import * as Icons from 'lucide-react';
 import './styles.css';
 
 const LONG_PRESS_MS = 380;
+const DELETE_TO_CURSOR_HEAD_HOLD_MS = 2000;
 const MODIFIER_ONLY_COMMIT_MS = 700;
-const DELETE_TO_HEAD_SEQUENCE = ['Ctrl+Shift+Home', 'Backspace'];
+const DELETE_TO_CURSOR_HEAD_SEQUENCE = ['Ctrl+Shift+Home', 'Backspace'];
 const VOICE_MODE_ORDER = ['wechat', 'lightning'];
-const DeleteToHeadIcon = Icons.ArrowLeftToLine || Icons.CornerUpLeft || Icons.Delete;
+const PUNCTUATION_TOOL_ITEMS = [
+  { id: 'copy', label: '复制', icon: 'Copy', shortcut: 'Ctrl+C' },
+  { id: 'paste', label: '粘贴', icon: 'ClipboardPaste', shortcut: 'Ctrl+V' },
+  { id: 'cut', label: '剪切', icon: 'Scissors', shortcut: 'Ctrl+X' }
+];
+const TabletModeIcon = Icons.TabletSmartphone || Icons.Tablet || Icons.MonitorSmartphone || Icons.PanelTop;
+const defaultTabletPreset = {
+  width: 0,
+  height: 0,
+  scale: 175,
+  orientation: 'portrait'
+};
+const defaultPunctuationItems = [
+  { id: 'comma', label: '逗号', text: '，' },
+  { id: 'period', label: '句号', text: '。' },
+  { id: 'exclamation', label: '感叹号', text: '！' },
+  { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
+];
 
 const defaultVoiceModes = {
   activeId: 'lightning',
@@ -32,12 +50,15 @@ const defaultVoiceModes = {
 };
 
 const previewConfig = {
-  schemaVersion: 2,
+  schemaVersion: 5,
   buttons: [
+    { id: 'punctuation', label: '标点', iconType: 'lucide', icon: 'Braces', image: '', shortcut: '' },
     { id: 'voice', label: '语音', iconType: 'lucide', icon: 'Mic', image: '', shortcut: 'Ctrl+I' },
     { id: 'send', label: '发送', iconType: 'lucide', icon: 'SendHorizontal', image: '', shortcut: 'Enter' },
     { id: 'delete', label: '删除', iconType: 'lucide', icon: 'Delete', image: '', shortcut: 'Backspace' }
   ],
+  punctuationItems: defaultPunctuationItems,
+  tabletPreset: defaultTabletPreset,
   voiceModes: defaultVoiceModes,
   window: { corner: 'bottom-right', buttonSize: 64, gap: 10, opacity: 0.78 }
 };
@@ -59,12 +80,19 @@ const api = window.vibeShortcut || {
     console.info(`Preview shortcut sequence: ${shortcuts.join(', ')}`);
     return { ok: true };
   },
-  startRepeatShortcut: async (shortcut) => {
-    console.info(`Preview repeat shortcut: ${shortcut}`);
+  sendText: async (text) => {
+    console.info(`Preview text: ${text}`);
     return { ok: true };
   },
-  stopRepeatShortcut: async () => ({ ok: true }),
+  applyTabletPreset: async (preset) => {
+    console.info('Preview tablet preset:', preset);
+    return { ok: true };
+  },
   setSideActionsOpen: async () => ({ ok: true }),
+  resetFloatingPosition: async () => ({ ok: true }),
+  moveFloatingDrag: async () => ({ ok: true }),
+  endFloatingDrag: async () => ({ ok: true }),
+  closeTrayMenu: async () => ({ ok: true }),
   getStartup: async () => ({ enabled: false, supported: false }),
   setStartup: async () => ({ enabled: false, supported: false }),
   openSettings: () => {
@@ -81,23 +109,42 @@ const api = window.vibeShortcut || {
 const mode = new URLSearchParams(window.location.search).get('mode') || 'floating';
 
 function App() {
-  return mode === 'settings' ? <SettingsApp /> : <FloatingPanel />;
+  if (mode === 'settings') return <SettingsApp />;
+  if (mode === 'tray') return <TrayQuickMenu />;
+  return <FloatingPanel />;
 }
 
 function FloatingPanel() {
   const [config, setConfig] = useConfig();
   const [activeId, setActiveId] = useState(null);
   const [sideActionType, setSideActionTypeState] = useState(null);
-  const [deleteHeadArmed, setDeleteHeadArmed] = useState(false);
-  const repeatDelayRef = useRef(null);
-  const repeatingRef = useRef(false);
-  const longPressTriggeredRef = useRef(false);
-  const pressedButtonRef = useRef(null);
-  const deleteHeadRef = useRef(null);
+  const pressRef = useRef(null);
+  const longPressTimerRef = useRef(null);
+  const pointerCleanupRef = useRef(null);
+  const sideActionTypeRef = useRef(null);
+  const sideActionCloseTimerRef = useRef(null);
+  const deleteRepeatTimerRef = useRef(null);
+  const deleteToHeadTimerRef = useRef(null);
+  const deleteRepeatActiveRef = useRef(false);
+  const deleteRepeatInFlightRef = useRef(null);
+  const shellPressRef = useRef(null);
+  const shellDragFrameRef = useRef(null);
+  const shellDragPayloadRef = useRef(null);
 
   useEffect(() => {
+    const handleSafetyStop = () => {
+      resetInteraction({ closeSideActions: true });
+    };
+
+    window.addEventListener('blur', handleSafetyStop);
+    window.addEventListener('pagehide', handleSafetyStop);
+    document.addEventListener('visibilitychange', handleSafetyStop);
+
     return () => {
-      stopRepeat();
+      window.removeEventListener('blur', handleSafetyStop);
+      window.removeEventListener('pagehide', handleSafetyStop);
+      document.removeEventListener('visibilitychange', handleSafetyStop);
+      resetInteraction({ closeSideActions: true });
       api.setSideActionsOpen(false);
     };
   }, []);
@@ -116,8 +163,9 @@ function FloatingPanel() {
   };
 
   function setSideActionType(type) {
+    clearSideActionCloseTimer();
+    sideActionTypeRef.current = type;
     setSideActionTypeState(type);
-    setDeleteHeadArmed(false);
     api.setSideActionsOpen(Boolean(type));
   }
 
@@ -138,38 +186,341 @@ function FloatingPanel() {
       return;
     }
 
+    if (isPunctuationButton(button)) {
+      pulse(button.id);
+      setSideActionType(sideActionTypeRef.current === 'punctuation' ? null : 'punctuation');
+      return;
+    }
+
     await triggerShortcut(button.id, button.shortcut);
   }
 
-  async function triggerDeleteToHead() {
+  async function triggerDeleteToCursorHead() {
     pulse('delete-head');
-    await api.sendShortcutSequence(DELETE_TO_HEAD_SEQUENCE);
+    await api.sendShortcutSequence(DELETE_TO_CURSOR_HEAD_SEQUENCE);
   }
 
-  function openVoiceSelector(button) {
-    longPressTriggeredRef.current = true;
-    pulse(button.id);
-    setSideActionType('voice');
+  async function insertPunctuation(item) {
+    pulse('punctuation');
+    await api.sendText(item.text, item.afterShortcut);
+    setSideActionType(null);
+  }
+
+  async function runPunctuationTool(tool) {
+    pulse(`punctuation:${tool.id}`);
+    await api.sendShortcut(tool.shortcut);
+    setSideActionType(null);
+  }
+
+  function isInsideButton(target) {
+    return Boolean(target && typeof target.closest === 'function' && target.closest('button'));
+  }
+
+  function startShellInteraction(event) {
+    if (event.button !== 0 || isInsideButton(event.target)) return;
+    if (event.detail > 1) return;
+
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    shellPressRef.current = {
+      pointerId: event.pointerId,
+      startX: event.screenX,
+      startY: event.screenY,
+      dragStarted: false
+    };
+  }
+
+  function moveShellInteraction(event) {
+    const press = shellPressRef.current;
+    if (!press || press.pointerId !== event.pointerId) return;
+
+    const distance = Math.hypot(event.screenX - press.startX, event.screenY - press.startY);
+    if (!press.dragStarted && distance < 4) return;
+
+    press.dragStarted = true;
+    event.preventDefault();
+    event.stopPropagation();
+    scheduleShellDragMove(press, event);
+  }
+
+  function endShellInteraction(event) {
+    const press = shellPressRef.current;
+    if (!press || press.pointerId !== event.pointerId) return;
+    shellPressRef.current = null;
+    if (press.dragStarted) {
+      flushShellDragMove();
+      Promise.resolve(api.endFloatingDrag()).catch(() => null);
+    }
+  }
+
+  function scheduleShellDragMove(press, event) {
+    shellDragPayloadRef.current = {
+      startX: press.startX,
+      startY: press.startY,
+      currentX: event.screenX,
+      currentY: event.screenY
+    };
+
+    if (shellDragFrameRef.current) return;
+    shellDragFrameRef.current = window.requestAnimationFrame(() => {
+      shellDragFrameRef.current = null;
+      flushShellDragMove();
+    });
+  }
+
+  function flushShellDragMove() {
+    const payload = shellDragPayloadRef.current;
+    shellDragPayloadRef.current = null;
+    if (!payload) return;
+    Promise.resolve(api.moveFloatingDrag(payload)).catch(() => null);
+  }
+
+  function clearShellDragState() {
+    shellPressRef.current = null;
+    shellDragPayloadRef.current = null;
+    if (shellDragFrameRef.current) {
+      window.cancelAnimationFrame(shellDragFrameRef.current);
+      shellDragFrameRef.current = null;
+    }
+    Promise.resolve(api.endFloatingDrag()).catch(() => null);
+  }
+
+  async function resetFloatingPosition(event) {
+    if (isInsideButton(event.target)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    resetInteraction({ closeSideActions: true });
+    await api.resetFloatingPosition();
+  }
+
+  function startPress(event, button) {
+    if (event.button === 2) return;
+    event.preventDefault();
+    const keepPunctuationOpen = isPunctuationButton(button) && sideActionTypeRef.current === 'punctuation';
+    resetInteraction({ closeSideActions: !keepPunctuationOpen });
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+
+    const press = {
+      button,
+      pointerId: event.pointerId,
+      startScreen: { x: event.screenX, y: event.screenY },
+      longPress: false,
+      longActionFired: false,
+      deleteToHeadTriggered: false
+    };
+    pressRef.current = press;
+    attachPressListeners(press.pointerId);
+
+    longPressTimerRef.current = window.setTimeout(() => {
+      handleLongPress(press);
+    }, LONG_PRESS_MS);
+
+    if (isRepeatDeleteButton(button)) {
+      deleteToHeadTimerRef.current = window.setTimeout(() => {
+        runHeldDeleteToCursorHead(press);
+      }, DELETE_TO_CURSOR_HEAD_HOLD_MS);
+    }
+  }
+
+  function handleLongPress(press) {
+    if (pressRef.current !== press) return;
+    press.longPress = true;
+
+    if (isVoiceButton(press.button)) {
+      setSideActionType('voice');
+      return;
+    }
+
+    if (isPunctuationButton(press.button)) {
+      setSideActionType('punctuation');
+      return;
+    }
+
+    if (isRepeatDeleteButton(press.button)) {
+      enterDeleteRepeating();
+      return;
+    }
+
+    if (isSendButton(press.button)) {
+      press.longActionFired = true;
+      pulse(press.button.id);
+      api.sendShortcut('Ctrl+Enter');
+    }
+  }
+
+  function enterDeleteRepeating() {
+    startDeleteRepeat();
+  }
+
+  async function runHeldDeleteToCursorHead(press) {
+    if (pressRef.current !== press || press.deleteToHeadTriggered) return;
+
+    press.deleteToHeadTriggered = true;
+    clearDeleteToHeadTimer();
+    clearLongPressTimer();
+    setSideActionType(null);
+    await stopDeleteRepeat({ waitForInFlight: true });
+    await triggerDeleteToCursorHead();
+  }
+
+  function startDeleteRepeat() {
+    stopDeleteRepeat();
+    deleteRepeatActiveRef.current = true;
+
+    const tick = () => {
+      if (!deleteRepeatActiveRef.current || deleteRepeatInFlightRef.current) return;
+      deleteRepeatInFlightRef.current = api.sendShortcut('Backspace')
+        .catch(() => null)
+        .finally(() => {
+          deleteRepeatInFlightRef.current = null;
+        });
+    };
+
+    tick();
+    deleteRepeatTimerRef.current = window.setInterval(tick, 110);
+  }
+
+  async function stopDeleteRepeat(options = {}) {
+    deleteRepeatActiveRef.current = false;
+    if (deleteRepeatTimerRef.current) {
+      window.clearInterval(deleteRepeatTimerRef.current);
+      deleteRepeatTimerRef.current = null;
+    }
+
+    if (options.waitForInFlight && deleteRepeatInFlightRef.current) {
+      await deleteRepeatInFlightRef.current.catch(() => null);
+      await sleep(35);
+    }
+  }
+
+  async function finishPress(options = {}) {
+    const { finalize = true, closeSideActions = false } = options;
+    const press = pressRef.current;
+
+    clearLongPressTimer();
+    clearDeleteToHeadTimer();
+    detachPressListeners();
+    pressRef.current = null;
+    await stopDeleteRepeat({ waitForInFlight: true });
+
+    if (!press) {
+      if (closeSideActions) setSideActionType(null);
+      return;
+    }
+
+    if (!finalize) {
+      if (closeSideActions || !press.longPress || isRepeatDeleteButton(press.button)) setSideActionType(null);
+      return;
+    }
+
+    if (!press.longPress) {
+      if (isPunctuationButton(press.button)) {
+        await triggerButton(press.button);
+        return;
+      }
+      setSideActionType(null);
+      if (isRepeatDeleteButton(press.button)) {
+        await triggerShortcut(press.button.id, press.button.shortcut || 'Backspace');
+        return;
+      }
+      await triggerButton(press.button);
+      return;
+    }
+
+    if (isRepeatDeleteButton(press.button)) {
+      setSideActionType(null);
+      return;
+    }
+
+    if (!press.longActionFired && !isVoiceButton(press.button) && !isPunctuationButton(press.button)) {
+      setSideActionType(null);
+    }
+  }
+
+  function resetInteraction(options = {}) {
+    clearLongPressTimer();
+    clearDeleteToHeadTimer();
+    detachPressListeners();
+    stopDeleteRepeat();
+    clearSideActionCloseTimer();
+    pressRef.current = null;
+    clearShellDragState();
+    if (options.closeSideActions) setSideActionType(null);
+  }
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function clearDeleteToHeadTimer() {
+    if (deleteToHeadTimerRef.current) {
+      window.clearTimeout(deleteToHeadTimerRef.current);
+      deleteToHeadTimerRef.current = null;
+    }
+  }
+
+  function attachPressListeners(pointerId) {
+    detachPressListeners();
+
+    const matchesPointer = (event) => event.pointerId === pointerId;
+    const onPointerMove = (event) => {
+      if (!matchesPointer(event)) return;
+    };
+    const onPointerUp = (event) => {
+      if (matchesPointer(event)) finishPress({ finalize: true });
+    };
+    const onPointerCancel = (event) => {
+      if (matchesPointer(event)) finishPress({ finalize: false, closeSideActions: true });
+    };
+
+    window.addEventListener('pointermove', onPointerMove, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerCancel, true);
+    pointerCleanupRef.current = () => {
+      window.removeEventListener('pointermove', onPointerMove, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+    };
+  }
+
+  function detachPressListeners() {
+    if (pointerCleanupRef.current) {
+      pointerCleanupRef.current();
+      pointerCleanupRef.current = null;
+    }
+  }
+
+  function scheduleSideActionClose() {
+    clearSideActionCloseTimer();
+    sideActionCloseTimerRef.current = window.setTimeout(() => {
+      sideActionCloseTimerRef.current = null;
+      if (!pressRef.current) setSideActionType(null);
+    }, 1600);
+  }
+
+  function clearSideActionCloseTimer() {
+    if (sideActionCloseTimerRef.current) {
+      window.clearTimeout(sideActionCloseTimerRef.current);
+      sideActionCloseTimerRef.current = null;
+    }
   }
 
   async function handleButtonContextMenu(event, button) {
     event.preventDefault();
     event.stopPropagation();
-
-    if (repeatDelayRef.current) {
-      window.clearTimeout(repeatDelayRef.current);
-      repeatDelayRef.current = null;
-    }
-    if (repeatingRef.current) {
-      repeatingRef.current = false;
-      api.stopRepeatShortcut();
-    }
-
-    longPressTriggeredRef.current = false;
-    pressedButtonRef.current = null;
+    resetInteraction({ closeSideActions: true });
 
     if (isVoiceButton(button)) {
-      openVoiceSelector(button);
+      setSideActionType('voice');
+      return;
+    }
+
+    if (isPunctuationButton(button)) {
+      setSideActionType('punctuation');
       return;
     }
 
@@ -178,110 +529,6 @@ function FloatingPanel() {
       await api.sendShortcut('Ctrl+Enter');
       return;
     }
-
-    if (isRepeatDeleteButton(button)) {
-      setSideActionType(null);
-      await triggerDeleteToHead();
-      return;
-    }
-
-    setSideActionType(null);
-  }
-
-  function startPress(event, button) {
-    if (event.button === 2) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    longPressTriggeredRef.current = false;
-    pressedButtonRef.current = button;
-
-    if (sideActionType) setSideActionType(null);
-
-    if (isVoiceButton(button)) {
-      repeatDelayRef.current = window.setTimeout(() => {
-        openVoiceSelector(button);
-      }, LONG_PRESS_MS);
-      return;
-    }
-
-    if (isRepeatDeleteButton(button)) {
-      triggerButton(button);
-      repeatDelayRef.current = window.setTimeout(() => {
-        longPressTriggeredRef.current = true;
-        repeatingRef.current = true;
-        setSideActionType('delete');
-        api.startRepeatShortcut(button.shortcut);
-      }, LONG_PRESS_MS);
-      return;
-    }
-
-    if (isSendButton(button)) {
-      repeatDelayRef.current = window.setTimeout(() => {
-        longPressTriggeredRef.current = true;
-        pulse(button.id);
-        api.sendShortcut('Ctrl+Enter');
-      }, LONG_PRESS_MS);
-      return;
-    }
-
-    triggerButton(button);
-  }
-
-  function movePress(event) {
-    if (!pressedButtonRef.current || sideActionType !== 'delete') return;
-    setDeleteHeadArmed(isPointerInside(event, deleteHeadRef.current));
-  }
-
-  async function stopPress(event, finalize = true) {
-    const pressedButton = pressedButtonRef.current;
-    const wasLongPress = longPressTriggeredRef.current;
-    const shouldDeleteToHead =
-      finalize &&
-      pressedButton &&
-      isRepeatDeleteButton(pressedButton) &&
-      wasLongPress &&
-      isPointerInside(event, deleteHeadRef.current);
-
-    if (repeatDelayRef.current) {
-      window.clearTimeout(repeatDelayRef.current);
-      repeatDelayRef.current = null;
-    }
-    if (repeatingRef.current) {
-      repeatingRef.current = false;
-      api.stopRepeatShortcut();
-    }
-
-    longPressTriggeredRef.current = false;
-    pressedButtonRef.current = null;
-
-    if (pressedButton && isRepeatDeleteButton(pressedButton)) {
-      setSideActionType(null);
-      if (shouldDeleteToHead) {
-        await triggerDeleteToHead();
-      }
-      return;
-    }
-
-    if (finalize && pressedButton && isVoiceButton(pressedButton) && !wasLongPress) {
-      triggerButton(pressedButton);
-      return;
-    }
-
-    if (finalize && pressedButton && isSendButton(pressedButton) && !wasLongPress) {
-      triggerButton(pressedButton);
-    }
-  }
-
-  function stopRepeat() {
-    if (repeatDelayRef.current) {
-      window.clearTimeout(repeatDelayRef.current);
-      repeatDelayRef.current = null;
-    }
-    repeatingRef.current = false;
-    longPressTriggeredRef.current = false;
-    pressedButtonRef.current = null;
-    setDeleteHeadArmed(false);
-    api.stopRepeatShortcut();
   }
 
   async function selectVoiceMode(modeId) {
@@ -300,7 +547,7 @@ function FloatingPanel() {
   function renderSideActions() {
     if (!sideActionType) return null;
 
-    const targetId = sideActionType === 'voice' ? 'voice' : 'delete';
+    const targetId = sideActionType === 'voice' ? 'voice' : 'punctuation';
     const rowIndex = Math.max(buttons.findIndex((button) => button.id === targetId), 0);
     const top = 12 + rowIndex * (buttonSize + config.window.gap) + buttonSize / 2;
 
@@ -326,18 +573,44 @@ function FloatingPanel() {
       );
     }
 
-    return (
-      <div className="side-action-row" style={{ top: `${top}px` }}>
-        <button
-          ref={deleteHeadRef}
-          type="button"
-          className={`side-action-button danger-action ${deleteHeadArmed ? 'is-armed' : ''}`}
-          title="删到光标前"
-        >
-          <DeleteToHeadIcon size={Math.round(sideButtonSize * 0.45)} strokeWidth={2.4} />
-        </button>
-      </div>
-    );
+    if (sideActionType === 'punctuation') {
+      return (
+        <div className="side-action-column punctuation-panel" onPointerDown={(event) => event.stopPropagation()}>
+          <div className="punctuation-tool-column">
+            {PUNCTUATION_TOOL_ITEMS.map((tool) => {
+              const ToolIcon = Icons[tool.icon] || Icons.Circle;
+              return (
+                <button
+                  key={tool.id}
+                  type="button"
+                  className="side-action-button punctuation-action punctuation-tool-action"
+                  title={tool.label}
+                  aria-label={tool.label}
+                  onClick={() => runPunctuationTool(tool)}
+                >
+                  <ToolIcon size={Math.round(sideButtonSize * 0.38)} strokeWidth={2.4} />
+                </button>
+              );
+            })}
+          </div>
+          <div className="punctuation-mark-column">
+            {getPunctuationItems(config).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className="side-action-button punctuation-action"
+                title={item.label}
+                onClick={() => insertPunctuation(item)}
+              >
+                <span className="punctuation-glyph">{item.text}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    return null;
   }
 
   return (
@@ -347,12 +620,20 @@ function FloatingPanel() {
         event.preventDefault();
       }}
       onPointerDown={(event) => {
-        if (event.target === event.currentTarget && sideActionType === 'voice') setSideActionType(null);
+        if (event.target === event.currentTarget && sideActionType) setSideActionType(null);
       }}
     >
       <div className="floating-layout" style={style}>
         {renderSideActions()}
-        <section className="floating-shell">
+        <section
+          className="floating-shell"
+          onPointerDown={startShellInteraction}
+          onPointerMove={moveShellInteraction}
+          onPointerUp={endShellInteraction}
+          onPointerCancel={endShellInteraction}
+          onLostPointerCapture={endShellInteraction}
+          onDoubleClick={resetFloatingPosition}
+        >
           <div className="shortcut-stack">
             {buttons.map((button) => (
               <button
@@ -361,10 +642,6 @@ function FloatingPanel() {
                 title={buttonTitle(button, config)}
                 type="button"
                 onPointerDown={(event) => startPress(event, button)}
-                onPointerMove={movePress}
-                onPointerUp={(event) => stopPress(event, true)}
-                onPointerCancel={(event) => stopPress(event, false)}
-                onLostPointerCapture={(event) => stopPress(event, false)}
                 onContextMenu={(event) => handleButtonContextMenu(event, button)}
               >
                 <ButtonIcon button={button} size={Math.round(buttonSize * 0.42)} />
@@ -373,6 +650,31 @@ function FloatingPanel() {
           </div>
         </section>
       </div>
+    </main>
+  );
+}
+
+function TrayQuickMenu() {
+  const [config] = useConfig();
+
+  if (!config) return null;
+
+  const tabletPreset = getTabletPreset(config);
+
+  async function applyTabletMode() {
+    await api.applyTabletPreset(tabletPreset);
+    await api.closeTrayMenu();
+  }
+
+  return (
+    <main className="tray-menu-stage" onContextMenu={(event) => event.preventDefault()}>
+      <section className="tray-menu-panel">
+        <button type="button" className="tray-menu-item" onClick={applyTabletMode}>
+          <TabletModeIcon size={17} />
+          <span>适配平板</span>
+        </button>
+
+      </section>
     </main>
   );
 }
@@ -461,12 +763,23 @@ function SettingsApp() {
 
   const selectedButton = draft.buttons.find((button) => button.id === selectedId) || draft.buttons[0];
   const voiceModes = getVoiceModes(draft);
+  const tabletPreset = getTabletPreset(draft);
 
   function setWindowPatch(patch) {
     setDraft((current) => ({
       ...current,
       window: {
         ...current.window,
+        ...patch
+      }
+    }));
+  }
+
+  function setTabletPresetPatch(patch) {
+    setDraft((current) => ({
+      ...current,
+      tabletPreset: {
+        ...getTabletPreset(current),
         ...patch
       }
     }));
@@ -827,6 +1140,62 @@ function SettingsApp() {
                     />
                   </label>
                 </div>
+
+                <div className="form-section">
+                  <h2>平板适配预设</h2>
+                  <div className="field-row">
+                    <label className="field">
+                      <span>分辨率宽度</span>
+                      <input
+                        type="number"
+                        min="0"
+                        max="10000"
+                        value={tabletPreset.width || ''}
+                        placeholder="保持当前"
+                        onChange={(event) => setTabletPresetPatch({ width: Number(event.target.value) || 0 })}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>分辨率高度</span>
+                      <input
+                        type="number"
+                        min="0"
+                        max="10000"
+                        value={tabletPreset.height || ''}
+                        placeholder="保持当前"
+                        onChange={(event) => setTabletPresetPatch({ height: Number(event.target.value) || 0 })}
+                      />
+                    </label>
+                  </div>
+
+                  <div className="field-row">
+                    <label className="field">
+                      <span>缩放比例</span>
+                      <input
+                        type="number"
+                        min="100"
+                        max="350"
+                        step="25"
+                        value={tabletPreset.scale}
+                        onChange={(event) => setTabletPresetPatch({ scale: Number(event.target.value) || 175 })}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>屏幕方向</span>
+                      <select
+                        value={tabletPreset.orientation}
+                        onChange={(event) => setTabletPresetPatch({ orientation: event.target.value })}
+                      >
+                        <option value="portrait">纵向</option>
+                        <option value="landscape">横向</option>
+                        <option value="portrait-flipped">纵向翻转</option>
+                        <option value="landscape-flipped">横向翻转</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <p className="field-hint">从右下角托盘图标左键菜单点击“适配平板”后应用；缩放比例可能需要注销或重新登录后完全生效。</p>
+                </div>
               </>
             ) : null}
           </section>
@@ -902,10 +1271,41 @@ function getActiveVoiceMode(config) {
   return voiceModes.options[voiceModes.activeId] || voiceModes.options.lightning;
 }
 
+function getTabletPreset(config) {
+  const source = config.tabletPreset || defaultTabletPreset;
+  const orientation = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(source.orientation)
+    ? source.orientation
+    : defaultTabletPreset.orientation;
+
+  return {
+    width: Math.max(0, Math.round(Number(source.width) || 0)),
+    height: Math.max(0, Math.round(Number(source.height) || 0)),
+    scale: Math.min(Math.max(Math.round(Number(source.scale) || defaultTabletPreset.scale), 100), 350),
+    orientation
+  };
+}
+
+function getPunctuationItems(config) {
+  const source = defaultPunctuationItems;
+
+  return source
+    .map((item, index) => ({
+      id: item.id || `punctuation-${index}`,
+      label: item.label || `标点 ${index + 1}`,
+      text: item.text || '',
+      afterShortcut: item.afterShortcut || ''
+    }))
+    .filter((item) => item.text);
+}
+
 function shortcutLabelForButton(button, config) {
   if (isVoiceButton(button)) {
     const activeMode = getActiveVoiceMode(config);
     return `${activeMode.label} · ${activeMode.shortcut || '未设置'}`;
+  }
+
+  if (isPunctuationButton(button)) {
+    return '点击展开标点';
   }
 
   return button.shortcut || '未设置';
@@ -917,11 +1317,19 @@ function buttonTitle(button, config) {
     return `${button.label} · ${activeMode.label} · ${activeMode.shortcut || '未设置'}`;
   }
 
+  if (isPunctuationButton(button)) {
+    return `${button.label} · 点击展开标点`;
+  }
+
   return `${button.label} · ${button.shortcut || '未设置'}`;
 }
 
 function isVoiceButton(button) {
   return button.id === 'voice';
+}
+
+function isPunctuationButton(button) {
+  return button.id === 'punctuation';
 }
 
 function isRepeatDeleteButton(button) {
@@ -934,10 +1342,8 @@ function isSendButton(button) {
   return button.id === 'send' || shortcut === 'enter';
 }
 
-function isPointerInside(event, element) {
-  if (!event || !element) return false;
-  const rect = element.getBoundingClientRect();
-  return event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function formatShortcut(event) {
