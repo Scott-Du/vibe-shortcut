@@ -10,9 +10,13 @@ const DEFAULT_PUNCTUATION_ITEMS = [
   { id: 'exclamation', label: '感叹号', text: '！' },
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
 ];
+const DEFAULT_DISPLAY_PRESETS = [
+  { id: 'preset-1', label: '设置一', width: 0, height: 0, scale: 175, orientation: 'portrait' },
+  { id: 'preset-2', label: '设置二', width: 0, height: 0, scale: 100, orientation: 'landscape' }
+];
 
 const DEFAULT_CONFIG = {
-  schemaVersion: 4,
+  schemaVersion: 5,
   buttons: [
     {
       id: 'punctuation',
@@ -48,6 +52,7 @@ const DEFAULT_CONFIG = {
     }
   ],
   punctuationItems: DEFAULT_PUNCTUATION_ITEMS,
+  displayPresets: DEFAULT_DISPLAY_PRESETS,
   voiceModes: {
     activeId: 'lightning',
     options: {
@@ -124,6 +129,7 @@ function mergeConfig(value) {
 
   next.buttons = ensureRequiredButtons(next.buttons);
   next.punctuationItems = mergePunctuationItems(rawValue.punctuationItems);
+  next.displayPresets = mergeDisplayPresets(rawValue.displayPresets);
   next.voiceModes = mergeVoiceModes(rawValue.voiceModes, legacyVoiceButton, rawSchemaVersion);
   next.window.buttonSize = clamp(Number(next.window.buttonSize) || 64, 48, 112);
   next.window.gap = clamp(Number(next.window.gap) || 10, 4, 24);
@@ -158,6 +164,31 @@ function mergePunctuationItems(value) {
       afterShortcut: item && item.afterShortcut ? String(item.afterShortcut) : ''
     }))
     .filter((item) => item.text);
+}
+
+function mergeDisplayPresets(value) {
+  const source = Array.isArray(value) && value.length ? value : DEFAULT_DISPLAY_PRESETS;
+  const presets = source
+    .map((preset, index) => normalizeDisplayPreset(preset, index))
+    .filter(Boolean);
+  return presets.length ? presets : DEFAULT_DISPLAY_PRESETS.map((preset, index) => normalizeDisplayPreset(preset, index));
+}
+
+function normalizeDisplayPreset(value, index = 0) {
+  const preset = value && typeof value === 'object' ? value : {};
+  const fallback = DEFAULT_DISPLAY_PRESETS[index] || DEFAULT_DISPLAY_PRESETS[0];
+  const orientation = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
+    ? preset.orientation
+    : fallback.orientation;
+
+  return {
+    id: preset.id ? String(preset.id) : `preset-${index + 1}`,
+    label: preset.label ? String(preset.label) : `设置${index + 1}`,
+    width: clamp(Math.round(Number(preset.width) || 0), 0, 10000),
+    height: clamp(Math.round(Number(preset.height) || 0), 0, 10000),
+    scale: clamp(Math.round(Number(preset.scale) || fallback.scale), 100, 350),
+    orientation
+  };
 }
 
 function mergeVoiceModes(value, legacyVoiceButton, schemaVersion) {
@@ -416,7 +447,8 @@ function createTray() {
   tray = new Tray(trayIcon());
   tray.setToolTip('Vibe Shortcut');
   updateTrayMenu();
-  tray.on('click', () => createSettingsWindow());
+  tray.on('click', () => showDisplayPresetMenu());
+  tray.on('right-click', () => updateTrayMenu());
 }
 
 function updateTrayMenu() {
@@ -451,6 +483,31 @@ function updateTrayMenu() {
       click: () => app.quit()
     }
   ]));
+}
+
+function showDisplayPresetMenu() {
+  if (!tray) return;
+  const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
+    ? config.displayPresets
+    : DEFAULT_DISPLAY_PRESETS;
+
+  const menu = Menu.buildFromTemplate(presets.map((preset, index) => ({
+    label: displayPresetMenuLabel(preset, index),
+    click: () => applyDisplayPresetFromTray(preset)
+  })));
+
+  tray.popUpContextMenu(menu);
+}
+
+function displayPresetMenuLabel(preset, index) {
+  const normalized = normalizeDisplayPreset(preset, index);
+  const orientationText = {
+    landscape: '横向',
+    portrait: '纵向',
+    'landscape-flipped': '横向翻转',
+    'portrait-flipped': '纵向翻转'
+  }[normalized.orientation] || normalized.orientation;
+  return `${normalized.label} · ${orientationText} · ${normalized.scale}%`;
 }
 
 function broadcastConfig() {
@@ -953,6 +1010,133 @@ async function sendShortcutSequence(shortcuts) {
   }
 
   return { ok: true };
+}
+
+function runPowerShell(command) {
+  return new Promise((resolve) => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+      windowsHide: true
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', (error) => {
+      resolve({ ok: false, error: error.message });
+    });
+    child.on('exit', (code) => {
+      resolve(code === 0
+        ? { ok: true, output: stdout.trim() }
+        : { ok: false, error: stderr.trim() || stdout.trim() || `PowerShell exited with code ${code}` });
+    });
+  });
+}
+
+async function applyDisplayPresetFromTray(preset) {
+  const result = await applyDisplayPreset(preset);
+  const failedStep = result.results.find((step) => !step.ok);
+
+  if (tray && typeof tray.displayBalloon === 'function') {
+    tray.displayBalloon({
+      title: result.ok ? '已应用屏幕预设' : '屏幕预设未完全应用',
+      content: result.ok
+        ? '分辨率和方向已提交；缩放比例可能需要注销或重新登录后完全生效。'
+        : failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。'
+    });
+  } else if (!result.ok) {
+    dialog.showErrorBox('屏幕预设未完全应用', failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。');
+  }
+
+  return result;
+}
+
+async function applyDisplayPreset(preset) {
+  const normalized = normalizeDisplayPreset(preset);
+  const results = [];
+
+  const displayResult = await applyDisplayMode(normalized);
+  results.push({ step: 'display', ...displayResult });
+  resizeFloatingWindow();
+
+  const scaleResult = await applyDisplayScale(normalized.scale);
+  results.push({ step: 'scale', ...scaleResult, needsSignOut: true });
+
+  return {
+    ok: results.every((result) => result.ok),
+    preset: normalized,
+    results
+  };
+}
+
+function applyDisplayMode(preset) {
+  const orientationCodes = {
+    landscape: 0,
+    portrait: 1,
+    'landscape-flipped': 2,
+    'portrait-flipped': 3
+  };
+  const orientation = orientationCodes[preset.orientation] ?? 1;
+  const width = Number(preset.width) || 0;
+  const height = Number(preset.height) || 0;
+  const typeDefinition = [
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'public static class DisplaySettings {',
+    '  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]',
+    '  public struct DEVMODE {',
+    '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;',
+    '    public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;',
+    '    public int dmFields;',
+    '    public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;',
+    '    public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;',
+    '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;',
+    '    public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;',
+    '    public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent;',
+    '    public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2;',
+    '    public int dmPanningWidth; public int dmPanningHeight;',
+    '  }',
+    '  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);',
+    '  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettingsEx(string deviceName, ref DEVMODE devMode, IntPtr hwnd, int flags, IntPtr lParam);',
+    '  public static int Apply(int width, int height, int orientation) {',
+    '    DEVMODE mode = new DEVMODE();',
+    '    mode.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));',
+    '    EnumDisplaySettings(null, -1, ref mode);',
+    '    int nextWidth = width > 0 && height > 0 ? width : mode.dmPelsWidth;',
+    '    int nextHeight = width > 0 && height > 0 ? height : mode.dmPelsHeight;',
+    '    if (!(width > 0 && height > 0) && ((mode.dmDisplayOrientation % 2) != (orientation % 2))) { int swap = nextWidth; nextWidth = nextHeight; nextHeight = swap; }',
+    '    mode.dmFields = 0x80 | 0x80000 | 0x100000;',
+    '    mode.dmDisplayOrientation = orientation;',
+    '    mode.dmPelsWidth = nextWidth;',
+    '    mode.dmPelsHeight = nextHeight;',
+    '    return ChangeDisplaySettingsEx(null, ref mode, IntPtr.Zero, 0, IntPtr.Zero);',
+    '  }',
+    '}'
+  ].join(' ');
+  const encodedType = Buffer.from(typeDefinition, 'utf16le').toString('base64');
+  const command = [
+    `$type = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedType}'))`,
+    'Add-Type -TypeDefinition $type',
+    `$result = [DisplaySettings]::Apply(${width}, ${height}, ${orientation})`,
+    'if ($result -ne 0) { throw "ChangeDisplaySettingsEx returned $result" }'
+  ].join('; ');
+
+  return runPowerShell(command);
+}
+
+function applyDisplayScale(scale) {
+  const dpi = Math.round(96 * clamp(Number(scale) || DEFAULT_DISPLAY_PRESETS[0].scale, 100, 350) / 100);
+  const command = [
+    `Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name Win8DpiScaling -Type DWord -Value 1`,
+    `Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name LogPixels -Type DWord -Value ${dpi}`,
+    'Start-Process -FilePath rundll32.exe -ArgumentList "user32.dll,UpdatePerUserSystemParameters" -WindowStyle Hidden'
+  ].join('; ');
+
+  return runPowerShell(command);
 }
 
 function startRepeatShortcut(shortcut) {
