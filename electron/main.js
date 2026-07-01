@@ -159,11 +159,10 @@ function mergePunctuationItems(value) {
   return items
     .map((item, index) => ({
       id: item && item.id ? String(item.id) : `punctuation-${index}`,
-      label: item && item.label ? String(item.label) : `标点 ${index + 1}`,
+      label: item && Object.prototype.hasOwnProperty.call(item, 'label') ? String(item.label) : `标点 ${index + 1}`,
       text: item && item.text ? String(item.text) : '',
       afterShortcut: item && item.afterShortcut ? String(item.afterShortcut) : ''
-    }))
-    .filter((item) => item.text);
+    }));
 }
 
 function mergeDisplayPresets(value) {

@@ -1169,6 +1169,7 @@ function SettingsApp() {
                 <span>名称</span>
                 <input
                   value={item.label}
+                  placeholder={`标点 ${index + 1}`}
                   onChange={(event) => updatePunctuationItem(item.id, { label: event.target.value })}
                 />
               </label>
@@ -1524,7 +1525,7 @@ function getEditablePunctuationItems(config) {
 
   return items.map((item, index) => ({
     id: item.id || `punctuation-${index}`,
-    label: item.label || `标点 ${index + 1}`,
+    label: Object.prototype.hasOwnProperty.call(item, 'label') ? item.label : `标点 ${index + 1}`,
     text: item.text || '',
     afterShortcut: item.afterShortcut || ''
   }));
