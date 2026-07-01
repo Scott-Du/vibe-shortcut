@@ -367,9 +367,15 @@ function createFloatingWindow() {
 
   floatingWindow.setAlwaysOnTop(true, 'screen-saver');
   updateFloatingWindowShape();
-  floatingWindow.once('ready-to-show', () => floatingWindow.showInactive());
+  floatingWindow.once('ready-to-show', () => {
+    floatingWindow.showInactive();
+    updateTrayMenu();
+  });
+  floatingWindow.on('show', () => updateTrayMenu());
+  floatingWindow.on('hide', () => updateTrayMenu());
   floatingWindow.on('closed', () => {
     floatingWindow = null;
+    updateTrayMenu();
   });
   loadRenderer(floatingWindow, 'floating');
 }
@@ -454,6 +460,7 @@ function createTray() {
 function updateTrayMenu() {
   if (!tray) return;
   const startup = getStartupState();
+  const floatingVisible = isFloatingWindowVisible();
 
   tray.setContextMenu(Menu.buildFromTemplate([
     {
@@ -462,10 +469,9 @@ function updateTrayMenu() {
     },
     {
       label: '显示悬浮窗',
-      click: () => {
-        if (!floatingWindow || floatingWindow.isDestroyed()) createFloatingWindow();
-        floatingWindow.showInactive();
-      }
+      type: 'checkbox',
+      checked: floatingVisible,
+      click: () => toggleFloatingWindowVisibility()
     },
     {
       label: '开机自启动',
@@ -483,6 +489,21 @@ function updateTrayMenu() {
       click: () => app.quit()
     }
   ]));
+}
+
+function isFloatingWindowVisible() {
+  return Boolean(floatingWindow && !floatingWindow.isDestroyed() && floatingWindow.isVisible());
+}
+
+function toggleFloatingWindowVisibility() {
+  if (isFloatingWindowVisible()) {
+    floatingWindow.hide();
+  } else {
+    if (!floatingWindow || floatingWindow.isDestroyed()) createFloatingWindow();
+    floatingWindow.showInactive();
+    floatingWindow.setAlwaysOnTop(true, 'screen-saver');
+  }
+  updateTrayMenu();
 }
 
 function showDisplayPresetMenu() {
