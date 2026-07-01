@@ -4,6 +4,7 @@ import * as Icons from 'lucide-react';
 import './styles.css';
 
 const LONG_PRESS_MS = 380;
+const DELETE_TO_CURSOR_HEAD_HOLD_MS = 2000;
 const MODIFIER_ONLY_COMMIT_MS = 700;
 const DELETE_TO_HEAD_SEQUENCE = ['Ctrl+Shift+Home', 'Backspace'];
 const VOICE_MODE_ORDER = ['wechat', 'lightning'];
@@ -72,6 +73,14 @@ const api = window.vibeShortcut || {
     console.info(`Preview shortcut sequence: ${shortcuts.join(', ')}`);
     return { ok: true };
   },
+  sendText: async (text, afterShortcut) => {
+    console.info(`Preview text: ${text}${afterShortcut ? ` then ${afterShortcut}` : ''}`);
+    return { ok: true };
+  },
+  insertText: async (text, afterShortcut) => {
+    console.info(`Preview text insert: ${text}${afterShortcut ? ` then ${afterShortcut}` : ''}`);
+    return { ok: true };
+  },
   startRepeatShortcut: async (shortcut) => {
     console.info(`Preview repeat shortcut: ${shortcut}`);
     return { ok: true };
@@ -97,6 +106,10 @@ function App() {
   return mode === 'settings' ? <SettingsApp /> : <FloatingPanel />;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function FloatingPanel() {
   const [config, setConfig] = useConfig();
   const [activeId, setActiveId] = useState(null);
@@ -107,6 +120,11 @@ function FloatingPanel() {
   const longPressTriggeredRef = useRef(false);
   const pressedButtonRef = useRef(null);
   const deleteHeadRef = useRef(null);
+  const deleteToHeadTimerRef = useRef(null);
+  const deleteToHeadTriggeredRef = useRef(false);
+  const deleteRepeatTimerRef = useRef(null);
+  const deleteRepeatActiveRef = useRef(false);
+  const deleteRepeatInFlightRef = useRef(null);
   const sideActionRequestRef = useRef(0);
 
   useEffect(() => {
@@ -187,12 +205,15 @@ function FloatingPanel() {
     await api.sendShortcutSequence(DELETE_TO_HEAD_SEQUENCE);
   }
 
-  function previewPunctuationItem(item) {
+  async function triggerPunctuationItem(item) {
     pulse(`punctuation:${item.id}`);
+    if (api.sendText) await api.sendText(item.text, item.afterShortcut);
+    else await api.insertText(item.text, item.afterShortcut);
   }
 
-  function previewPunctuationTool(tool) {
+  async function triggerPunctuationTool(tool) {
     pulse(`punctuation:${tool.id}`);
+    await api.sendShortcut(tool.shortcut);
   }
 
   function openVoiceSelector(button, options = {}) {
@@ -248,6 +269,7 @@ function FloatingPanel() {
     event.currentTarget.setPointerCapture?.(event.pointerId);
     longPressTriggeredRef.current = false;
     pressedButtonRef.current = button;
+    deleteToHeadTriggeredRef.current = false;
 
     if (sideActionType) setSideActionType(null);
 
@@ -259,13 +281,13 @@ function FloatingPanel() {
     }
 
     if (isRepeatDeleteButton(button)) {
-      triggerButton(button);
       repeatDelayRef.current = window.setTimeout(() => {
         longPressTriggeredRef.current = true;
-        repeatingRef.current = true;
-        setSideActionType('delete');
-        api.startRepeatShortcut(button.shortcut);
+        startDeleteRepeat();
       }, LONG_PRESS_MS);
+      deleteToHeadTimerRef.current = window.setTimeout(() => {
+        runHeldDeleteToHead(button);
+      }, DELETE_TO_CURSOR_HEAD_HOLD_MS);
       return;
     }
 
@@ -289,6 +311,7 @@ function FloatingPanel() {
   async function stopPress(event, finalize = true) {
     const pressedButton = pressedButtonRef.current;
     const wasLongPress = longPressTriggeredRef.current;
+    const deleteToHeadTriggered = deleteToHeadTriggeredRef.current;
     const shouldDeleteToHead =
       finalize &&
       pressedButton &&
@@ -300,18 +323,21 @@ function FloatingPanel() {
       window.clearTimeout(repeatDelayRef.current);
       repeatDelayRef.current = null;
     }
-    if (repeatingRef.current) {
-      repeatingRef.current = false;
-      api.stopRepeatShortcut();
+    clearDeleteToHeadTimer();
+    if (pressedButton && isRepeatDeleteButton(pressedButton)) {
+      await stopDeleteRepeat({ waitForInFlight: true });
     }
 
     longPressTriggeredRef.current = false;
     pressedButtonRef.current = null;
+    deleteToHeadTriggeredRef.current = false;
 
     if (pressedButton && isRepeatDeleteButton(pressedButton)) {
       setSideActionType(null);
-      if (shouldDeleteToHead) {
+      if (shouldDeleteToHead && !deleteToHeadTriggered) {
         await triggerDeleteToHead();
+      } else if (finalize && !wasLongPress && !deleteToHeadTriggered) {
+        await triggerShortcut(pressedButton.id, pressedButton.shortcut || 'Backspace');
       }
       return;
     }
@@ -331,11 +357,68 @@ function FloatingPanel() {
       window.clearTimeout(repeatDelayRef.current);
       repeatDelayRef.current = null;
     }
+    clearDeleteToHeadTimer();
     repeatingRef.current = false;
     longPressTriggeredRef.current = false;
     pressedButtonRef.current = null;
+    deleteToHeadTriggeredRef.current = false;
     setDeleteHeadArmed(false);
     api.stopRepeatShortcut();
+    stopDeleteRepeat();
+  }
+
+  function clearDeleteToHeadTimer() {
+    if (deleteToHeadTimerRef.current) {
+      window.clearTimeout(deleteToHeadTimerRef.current);
+      deleteToHeadTimerRef.current = null;
+    }
+  }
+
+  function startDeleteRepeat() {
+    stopDeleteRepeat();
+    repeatingRef.current = true;
+    deleteRepeatActiveRef.current = true;
+
+    const tick = () => {
+      if (!deleteRepeatActiveRef.current || deleteRepeatInFlightRef.current) return;
+      deleteRepeatInFlightRef.current = api.sendShortcut('Backspace')
+        .catch(() => null)
+        .finally(() => {
+          deleteRepeatInFlightRef.current = null;
+        });
+    };
+
+    tick();
+    deleteRepeatTimerRef.current = window.setInterval(tick, 110);
+  }
+
+  async function stopDeleteRepeat(options = {}) {
+    repeatingRef.current = false;
+    deleteRepeatActiveRef.current = false;
+    if (deleteRepeatTimerRef.current) {
+      window.clearInterval(deleteRepeatTimerRef.current);
+      deleteRepeatTimerRef.current = null;
+    }
+
+    if (options.waitForInFlight && deleteRepeatInFlightRef.current) {
+      await deleteRepeatInFlightRef.current.catch(() => null);
+      await sleep(35);
+    }
+  }
+
+  async function runHeldDeleteToHead(button) {
+    if (pressedButtonRef.current !== button || deleteToHeadTriggeredRef.current) return;
+
+    deleteToHeadTriggeredRef.current = true;
+    longPressTriggeredRef.current = true;
+    clearDeleteToHeadTimer();
+    if (repeatDelayRef.current) {
+      window.clearTimeout(repeatDelayRef.current);
+      repeatDelayRef.current = null;
+    }
+    setSideActionType(null);
+    await stopDeleteRepeat({ waitForInFlight: true });
+    await triggerDeleteToHead();
   }
 
   async function selectVoiceMode(modeId) {
@@ -393,7 +476,7 @@ function FloatingPanel() {
                   className="side-action-button punctuation-action punctuation-tool-action"
                   title={tool.label}
                   aria-label={tool.label}
-                  onClick={() => previewPunctuationTool(tool)}
+                  onClick={() => triggerPunctuationTool(tool)}
                 >
                   <ToolIcon size={Math.round(sideButtonSize * 0.38)} strokeWidth={2.4} />
                 </button>
@@ -407,7 +490,7 @@ function FloatingPanel() {
                 type="button"
                 className="side-action-button punctuation-action"
                 title={item.label}
-                onClick={() => previewPunctuationItem(item)}
+                onClick={() => triggerPunctuationItem(item)}
               >
                 <span className="punctuation-glyph">{item.text}</span>
               </button>

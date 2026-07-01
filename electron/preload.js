@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('vibeShortcut', {
   saveConfig: (config, options) => ipcRenderer.invoke('config:save', config, options),
   sendShortcut: (shortcut) => ipcRenderer.invoke('shortcut:send', shortcut),
   sendShortcutSequence: (shortcuts) => ipcRenderer.invoke('shortcut:sendSequence', shortcuts),
+  sendText: (text, afterShortcut) => ipcRenderer.invoke('text:send', text, afterShortcut),
+  insertText: (text, afterShortcut) => ipcRenderer.invoke('text:send', text, afterShortcut),
   startRepeatShortcut: (shortcut) => ipcRenderer.invoke('shortcut:startRepeat', shortcut),
   stopRepeatShortcut: () => ipcRenderer.invoke('shortcut:stopRepeat'),
   setSideActionsOpen: (open) => ipcRenderer.invoke('floating:setSideActionsOpen', open),

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, protocol, screen } = require('electron');
+const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, protocol, screen } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -83,6 +83,10 @@ let tray;
 let config;
 let repeatProcess;
 let sideActionsOpen = false;
+let inputSenderProcess;
+let inputSenderBuffer = '';
+let inputSenderRequestId = 0;
+const inputSenderPending = new Map();
 
 function configPath() {
   return path.join(app.getPath('userData'), 'config.json');
@@ -557,17 +561,21 @@ function shortcutToNativeEvents(shortcut) {
     if (!uniqueModifiers.some((item) => item.vk === modifier.vk)) uniqueModifiers.push(modifier);
   }
 
-  for (const modifier of uniqueModifiers) events.push({ vk: modifier.vk, up: false });
+  for (const modifier of uniqueModifiers) events.push(keyEvent(modifier.vk, false));
 
   if (key) {
     const keyVk = keyToVirtualKey(key);
     if (!keyVk) throw new Error(`Native sender does not support ${key}.`);
-    events.push({ vk: keyVk, up: false });
-    events.push({ vk: keyVk, up: true });
+    events.push(keyEvent(keyVk, false));
+    events.push(keyEvent(keyVk, true));
   }
 
-  for (const modifier of [...uniqueModifiers].reverse()) events.push({ vk: modifier.vk, up: true });
+  for (const modifier of [...uniqueModifiers].reverse()) events.push(keyEvent(modifier.vk, true));
   return events;
+}
+
+function keyEvent(vk, up) {
+  return { vk, up, extended: isExtendedVirtualKey(vk) };
 }
 
 function keyToVirtualKey(key) {
@@ -604,69 +612,251 @@ function keyToVirtualKey(key) {
   return null;
 }
 
-function sendNativeShortcut(shortcut) {
+function isExtendedVirtualKey(vk) {
+  return new Set([
+    0x21, // PageUp
+    0x22, // PageDown
+    0x23, // End
+    0x24, // Home
+    0x25, // Left
+    0x26, // Up
+    0x27, // Right
+    0x28, // Down
+    0x2d, // Insert
+    0x2e, // Delete
+    0x5b // Left Windows
+  ]).has(vk);
+}
+
+function inputSenderScript() {
+  return `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeInput {
+  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public UInt32 type; public INPUTUNION u; }
+  [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
+    [FieldOffset(0)] public KEYBDINPUT ki;
+    [FieldOffset(0)] public MOUSEINPUT mi;
+    [FieldOffset(0)] public HARDWAREINPUT hi;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT {
+    public UInt16 wVk; public UInt16 wScan; public UInt32 dwFlags; public UInt32 time; public IntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT {
+    public Int32 dx; public Int32 dy; public UInt32 mouseData; public UInt32 dwFlags; public UInt32 time; public IntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct HARDWAREINPUT {
+    public UInt32 uMsg; public UInt16 wParamL; public UInt16 wParamH;
+  }
+  [DllImport("user32.dll", SetLastError=true)] public static extern UInt32 SendInput(UInt32 nInputs, INPUT[] pInputs, Int32 cbSize);
+  [DllImport("user32.dll")] public static extern UInt32 MapVirtualKey(UInt32 uCode, UInt32 uMapType);
+  public static void SendChar(UInt16 scan, bool keyUp) {
+    INPUT[] inputs = new INPUT[1];
+    inputs[0].type = 1;
+    inputs[0].u.ki.wVk = 0;
+    inputs[0].u.ki.wScan = scan;
+    inputs[0].u.ki.dwFlags = 0x0004u | (keyUp ? 0x0002u : 0u);
+    inputs[0].u.ki.time = 0;
+    inputs[0].u.ki.dwExtraInfo = IntPtr.Zero;
+    UInt32 sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+    if (sent == 0) throw new InvalidOperationException("SendInput failed " + Marshal.GetLastWin32Error());
+  }
+  public static void SendKey(UInt16 vk, bool keyUp, bool extended) {
+    INPUT[] inputs = new INPUT[1];
+    inputs[0].type = 1;
+    inputs[0].u.ki.wVk = 0;
+    inputs[0].u.ki.wScan = (UInt16)MapVirtualKey(vk, 0);
+    inputs[0].u.ki.dwFlags = 0x0008u | (keyUp ? 0x0002u : 0u) | (extended ? 0x0001u : 0u);
+    inputs[0].u.ki.time = 0;
+    inputs[0].u.ki.dwExtraInfo = IntPtr.Zero;
+    UInt32 sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+    if (sent == 0) throw new InvalidOperationException("SendInput failed " + Marshal.GetLastWin32Error());
+  }
+}
+'@
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+  $id = ''
+  try {
+    $request = $line | ConvertFrom-Json
+    $id = [string]$request.id
+    foreach ($action in $request.actions) {
+      if ($action.type -eq 'char') {
+        [NativeInput]::SendChar([UInt16]$action.scan, $false)
+        Start-Sleep -Milliseconds 2
+        [NativeInput]::SendChar([UInt16]$action.scan, $true)
+        Start-Sleep -Milliseconds 2
+      } elseif ($action.type -eq 'key') {
+        [NativeInput]::SendKey([UInt16]$action.vk, [bool]$action.up, [bool]$action.extended)
+        Start-Sleep -Milliseconds 8
+      } elseif ($action.type -eq 'sleep') {
+        Start-Sleep -Milliseconds ([int]$action.ms)
+      }
+    }
+    [pscustomobject]@{ id = $id; ok = $true } | ConvertTo-Json -Compress
+  } catch {
+    [pscustomobject]@{ id = $id; ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+  }
+}
+`;
+}
+
+function ensureInputSender() {
+  if (inputSenderProcess && !inputSenderProcess.killed && inputSenderProcess.stdin.writable) {
+    return inputSenderProcess;
+  }
+
+  inputSenderBuffer = '';
+  inputSenderProcess = spawn('powershell.exe', [
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-EncodedCommand',
+    Buffer.from(inputSenderScript(), 'utf16le').toString('base64')
+  ], {
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  inputSenderProcess.stdout.on('data', (chunk) => {
+    inputSenderBuffer += chunk.toString();
+    const lines = inputSenderBuffer.split(/\r?\n/);
+    inputSenderBuffer = lines.pop() || '';
+    for (const line of lines) handleInputSenderLine(line);
+  });
+
+  inputSenderProcess.stderr.on('data', () => {
+    // Keep stderr drained; request-level errors are reported through stdout.
+  });
+
+  inputSenderProcess.on('error', (error) => {
+    rejectPendingInputRequests(error.message);
+  });
+
+  inputSenderProcess.on('exit', (code) => {
+    inputSenderProcess = null;
+    inputSenderBuffer = '';
+    rejectPendingInputRequests(`Input sender exited with code ${code}`);
+  });
+
+  return inputSenderProcess;
+}
+
+function handleInputSenderLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let result;
+  try {
+    result = JSON.parse(trimmed);
+  } catch {
+    return;
+  }
+
+  const pending = inputSenderPending.get(String(result.id));
+  if (!pending) return;
+
+  clearTimeout(pending.timeout);
+  inputSenderPending.delete(String(result.id));
+  pending.resolve(result.ok ? { ok: true } : { ok: false, error: result.error || 'Input sender failed.' });
+}
+
+function rejectPendingInputRequests(error) {
+  for (const [id, pending] of inputSenderPending.entries()) {
+    clearTimeout(pending.timeout);
+    pending.resolve({ ok: false, error });
+    inputSenderPending.delete(id);
+  }
+}
+
+function stopInputSender() {
+  if (!inputSenderProcess || inputSenderProcess.killed) return;
+  try {
+    inputSenderProcess.stdin.end();
+  } catch {
+    // Best-effort shutdown.
+  }
+  try {
+    inputSenderProcess.kill();
+  } catch {
+    // Best-effort shutdown.
+  }
+  inputSenderProcess = null;
+  inputSenderBuffer = '';
+  rejectPendingInputRequests('Input sender stopped.');
+}
+
+function sendInputActions(actions) {
+  if (!actions.length) return Promise.resolve({ ok: false, error: 'Input action list is empty.' });
+
   return new Promise((resolve) => {
-    let events;
-    try {
-      events = shortcutToNativeEvents(shortcut);
-    } catch (error) {
+    const child = ensureInputSender();
+    const id = String(++inputSenderRequestId);
+    const timeout = setTimeout(() => {
+      inputSenderPending.delete(id);
+      resolve({ ok: false, error: 'Input sender timed out.' });
+    }, 5000);
+
+    inputSenderPending.set(id, { resolve, timeout });
+    child.stdin.write(`${JSON.stringify({ id, actions })}\n`, 'utf8', (error) => {
+      if (!error || !inputSenderPending.has(id)) return;
+      clearTimeout(timeout);
+      inputSenderPending.delete(id);
       resolve({ ok: false, error: error.message });
-      return;
-    }
-
-    if (!events.length) {
-      resolve({ ok: false, error: 'Shortcut is empty.' });
-      return;
-    }
-
-    const eventCommands = [];
-    for (const event of events) {
-      eventCommands.push(`[NativeKeyboard]::keybd_event(${event.vk}, 0, ${event.up ? 2 : 0}, [UIntPtr]::Zero)`);
-      eventCommands.push('Start-Sleep -Milliseconds 35');
-    }
-
-    const command = [
-      'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class NativeKeyboard { [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo); }\'',
-      'Start-Sleep -Milliseconds 45',
-      ...eventCommands
-    ].join('; ');
-
-    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
-      windowsHide: true
-    });
-
-    let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('error', (error) => {
-      resolve({ ok: false, error: error.message });
-    });
-    child.on('exit', (code) => {
-      resolve(code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `PowerShell exited with code ${code}` });
     });
   });
 }
 
-function escapeSendKeysChar(value) {
-  return value.replace(/[+^%~()[\]{}]/g, '{$&}');
+function nativeEventsToInputActions(events) {
+  return events.map((event) => {
+    if (event.sleep) return { type: 'sleep', ms: event.sleep };
+    return { type: 'key', vk: event.vk, up: event.up, extended: event.extended };
+  });
 }
 
-function sendShortcut(shortcut) {
+function sendNativeEvents(events) {
+  if (!events.length) return Promise.resolve({ ok: false, error: 'Shortcut is empty.' });
+  return sendInputActions(nativeEventsToInputActions(events));
+}
+
+function sendNativeShortcut(shortcut) {
+  let events;
+  try {
+    events = shortcutToNativeEvents(shortcut);
+  } catch (error) {
+    return Promise.resolve({ ok: false, error: error.message });
+  }
+
+  return sendNativeEvents(events);
+}
+
+function sendNativeShortcutSequence(shortcuts) {
+  const events = [];
+
+  try {
+    for (const shortcut of shortcuts) {
+      events.push(...shortcutToNativeEvents(shortcut));
+      events.push({ sleep: 45 });
+    }
+  } catch (error) {
+    return Promise.resolve({ ok: false, error: error.message });
+  }
+
+  return sendNativeEvents(events);
+}
+
+function shortcutSequenceNeedsNativeSender(shortcuts) {
+  return shortcuts.some((shortcut) => shortcutNeedsNativeSender(shortcut));
+}
+
+function shortcutsToSendKeys(shortcuts) {
+  return shortcuts.map((shortcut) => shortcutToSendKeys(shortcut)).join('');
+}
+
+function sendKeysPayload(sendKeys) {
   return new Promise((resolve) => {
-    if (shortcutNeedsNativeSender(shortcut)) {
-      sendNativeShortcut(shortcut).then(resolve);
-      return;
-    }
-
-    let sendKeys;
-    try {
-      sendKeys = shortcutToSendKeys(shortcut);
-    } catch (error) {
-      resolve({ ok: false, error: error.message });
-      return;
-    }
-
     if (!sendKeys) {
       resolve({ ok: false, error: 'Shortcut is empty.' });
       return;
@@ -679,7 +869,7 @@ function sendShortcut(shortcut) {
       `[System.Windows.Forms.SendKeys]::SendWait('${escaped}')`
     ].join('; ');
 
-    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', command], {
       windowsHide: true
     });
 
@@ -696,9 +886,65 @@ function sendShortcut(shortcut) {
   });
 }
 
+function sendText(text, afterShortcut) {
+  const value = String(text || '');
+  if (!value) return Promise.resolve({ ok: false, error: 'Text is empty.' });
+
+  const previousText = clipboard.readText();
+  clipboard.writeText(value);
+
+  const shortcuts = ['Ctrl+V'];
+  const trailingShortcut = String(afterShortcut || '').trim();
+  if (trailingShortcut) shortcuts.push(trailingShortcut);
+
+  return sendNativeShortcutSequence(shortcuts).then((result) => {
+    setTimeout(() => {
+      try {
+        if (clipboard.readText() === value) clipboard.writeText(previousText);
+      } catch {
+        // Clipboard restore is best-effort.
+      }
+    }, 180);
+    return result;
+  });
+}
+
+function escapeSendKeysChar(value) {
+  return value.replace(/[+^%~()[\]{}]/g, '{$&}');
+}
+
+function sendShortcut(shortcut) {
+  return sendNativeShortcut(shortcut).then((nativeResult) => {
+    if (nativeResult.ok || shortcutNeedsNativeSender(shortcut)) return nativeResult;
+
+    let sendKeys;
+    try {
+      sendKeys = shortcutToSendKeys(shortcut);
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+
+    if (!sendKeys) return { ok: false, error: 'Shortcut is empty.' };
+    return sendKeysPayload(sendKeys);
+  });
+}
+
 async function sendShortcutSequence(shortcuts) {
   if (!Array.isArray(shortcuts) || !shortcuts.length) {
     return { ok: false, error: 'Shortcut sequence is empty.' };
+  }
+
+  const nativeResult = await sendNativeShortcutSequence(shortcuts);
+  if (nativeResult.ok) return nativeResult;
+
+  if (!shortcutSequenceNeedsNativeSender(shortcuts)) {
+    try {
+      const sendKeys = shortcutsToSendKeys(shortcuts);
+      const sendKeysResult = await sendKeysPayload(sendKeys);
+      if (sendKeysResult.ok) return sendKeysResult;
+    } catch {
+      // Fall back to sending each shortcut below.
+    }
   }
 
   for (const shortcut of shortcuts) {
@@ -804,6 +1050,8 @@ function registerIpc() {
   ipcMain.handle('config:save', (_event, nextConfig, options) => saveConfig(nextConfig, options));
   ipcMain.handle('shortcut:send', (_event, shortcut) => sendShortcut(shortcut));
   ipcMain.handle('shortcut:sendSequence', (_event, shortcuts) => sendShortcutSequence(shortcuts));
+  ipcMain.handle('text:send', (_event, text, afterShortcut) => sendText(text, afterShortcut));
+  ipcMain.handle('text:insert', (_event, text, afterShortcut) => sendText(text, afterShortcut));
   ipcMain.handle('shortcut:startRepeat', (_event, shortcut) => startRepeatShortcut(shortcut));
   ipcMain.handle('shortcut:stopRepeat', () => stopRepeatShortcut());
   ipcMain.handle('floating:setSideActionsOpen', (_event, open) => setSideActionsOpen(open));
@@ -851,10 +1099,15 @@ if (!gotSingleInstanceLock) {
     registerIpc();
     createFloatingWindow();
     createTray();
+    ensureInputSender();
 
     app.on('activate', () => {
       if (!floatingWindow) createFloatingWindow();
     });
+  });
+
+  app.on('before-quit', () => {
+    stopInputSender();
   });
 
   app.on('window-all-closed', () => {
