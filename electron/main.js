@@ -4,10 +4,24 @@ const fs = require('fs');
 const path = require('path');
 
 const DEV_URL = 'http://127.0.0.1:5173';
+const DEFAULT_PUNCTUATION_ITEMS = [
+  { id: 'comma', label: '逗号', text: '，' },
+  { id: 'period', label: '句号', text: '。' },
+  { id: 'exclamation', label: '感叹号', text: '！' },
+  { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
+];
 
 const DEFAULT_CONFIG = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   buttons: [
+    {
+      id: 'punctuation',
+      label: '标点',
+      iconType: 'lucide',
+      icon: 'Braces',
+      image: '',
+      shortcut: ''
+    },
     {
       id: 'voice',
       label: '语音',
@@ -33,6 +47,7 @@ const DEFAULT_CONFIG = {
       shortcut: 'Backspace'
     }
   ],
+  punctuationItems: DEFAULT_PUNCTUATION_ITEMS,
   voiceModes: {
     activeId: 'lightning',
     options: {
@@ -103,6 +118,8 @@ function mergeConfig(value) {
     shortcut: button.shortcut || ''
   }));
 
+  next.buttons = ensureRequiredButtons(next.buttons);
+  next.punctuationItems = mergePunctuationItems(rawValue.punctuationItems);
   next.voiceModes = mergeVoiceModes(rawValue.voiceModes, legacyVoiceButton, rawSchemaVersion);
   next.window.buttonSize = clamp(Number(next.window.buttonSize) || 64, 48, 112);
   next.window.gap = clamp(Number(next.window.gap) || 10, 4, 24);
@@ -116,6 +133,27 @@ function mergeConfig(value) {
   }
 
   return next;
+}
+
+function ensureRequiredButtons(buttons) {
+  const existingIds = new Set(buttons.map((button) => button.id));
+  const requiredButtons = DEFAULT_CONFIG.buttons.filter((button) => !existingIds.has(button.id));
+  return [
+    ...requiredButtons,
+    ...buttons
+  ];
+}
+
+function mergePunctuationItems(value) {
+  const items = Array.isArray(value) && value.length ? value : DEFAULT_PUNCTUATION_ITEMS;
+  return items
+    .map((item, index) => ({
+      id: item && item.id ? String(item.id) : `punctuation-${index}`,
+      label: item && item.label ? String(item.label) : `标点 ${index + 1}`,
+      text: item && item.text ? String(item.text) : '',
+      afterShortcut: item && item.afterShortcut ? String(item.afterShortcut) : ''
+    }))
+    .filter((item) => item.text);
 }
 
 function mergeVoiceModes(value, legacyVoiceButton, schemaVersion) {
@@ -171,20 +209,33 @@ function loadConfig() {
   }
 }
 
-function saveConfig(nextConfig) {
+function saveConfig(nextConfig, options = {}) {
+  const previousLayoutSignature = config ? floatingLayoutSignature(config) : null;
   config = mergeConfig(nextConfig);
+  const nextLayoutSignature = floatingLayoutSignature(config);
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(config, null, 2), 'utf8');
-  resizeFloatingWindow();
+  if (!options.preserveFloatingBounds && previousLayoutSignature !== nextLayoutSignature) {
+    resizeFloatingWindow();
+  } else {
+    updateFloatingWindowShape();
+  }
   broadcastConfig();
   return config;
+}
+
+function floatingLayoutSignature(targetConfig) {
+  return JSON.stringify({
+    window: targetConfig.window,
+    buttonCount: Array.isArray(targetConfig.buttons) ? targetConfig.buttons.length : 0
+  });
 }
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-function floatingSize() {
+function floatingSize(open = true) {
   const padding = 12;
   const edgePadding = 8;
   const buttonSize = config.window.buttonSize;
@@ -194,7 +245,7 @@ function floatingSize() {
   const shellWidth = buttonSize + padding * 2;
   const shellHeight = padding * 2 + stackHeight;
   const sideButtonSize = Math.round(buttonSize * 0.78);
-  const sideExtraWidth = sideActionsOpen ? sideButtonSize * 2 + gap * 3 : 0;
+  const sideExtraWidth = open ? sideButtonSize * 2 + gap * 3 : 0;
 
   return {
     width: Math.round(shellWidth + edgePadding * 2 + sideExtraWidth),
@@ -206,7 +257,7 @@ function floatingBounds() {
   const display = screen.getPrimaryDisplay();
   const workArea = display.workArea;
   const margin = 18;
-  const size = floatingSize();
+  const size = floatingSize(true);
   const x = config.window.corner.includes('right')
     ? workArea.x + workArea.width - size.width - margin
     : workArea.x + margin;
@@ -280,6 +331,7 @@ function createFloatingWindow() {
   });
 
   floatingWindow.setAlwaysOnTop(true, 'screen-saver');
+  updateFloatingWindowShape();
   floatingWindow.once('ready-to-show', () => floatingWindow.showInactive());
   floatingWindow.on('closed', () => {
     floatingWindow = null;
@@ -323,7 +375,26 @@ function createSettingsWindow() {
 function resizeFloatingWindow() {
   if (!floatingWindow || floatingWindow.isDestroyed()) return;
   floatingWindow.setBounds(floatingBounds());
+  updateFloatingWindowShape();
   floatingWindow.setAlwaysOnTop(true, 'screen-saver');
+}
+
+function updateFloatingWindowShape() {
+  if (!floatingWindow || floatingWindow.isDestroyed() || typeof floatingWindow.setShape !== 'function') return;
+
+  const expandedSize = floatingSize(true);
+  if (sideActionsOpen) {
+    floatingWindow.setShape([{ x: 0, y: 0, width: expandedSize.width, height: expandedSize.height }]);
+    return;
+  }
+
+  const compactSize = floatingSize(false);
+  floatingWindow.setShape([{
+    x: expandedSize.width - compactSize.width,
+    y: 0,
+    width: compactSize.width,
+    height: compactSize.height
+  }]);
 }
 
 function trayIcon() {
@@ -683,8 +754,11 @@ function stopRepeatShortcut() {
 }
 
 function setSideActionsOpen(nextOpen) {
-  sideActionsOpen = Boolean(nextOpen);
-  resizeFloatingWindow();
+  const open = Boolean(nextOpen);
+  if (sideActionsOpen === open) return { ok: true, open: sideActionsOpen };
+
+  sideActionsOpen = open;
+  updateFloatingWindowShape();
   return { ok: true, open: sideActionsOpen };
 }
 
@@ -727,7 +801,7 @@ function broadcastStartup(state = getStartupState()) {
 
 function registerIpc() {
   ipcMain.handle('config:get', () => config);
-  ipcMain.handle('config:save', (_event, nextConfig) => saveConfig(nextConfig));
+  ipcMain.handle('config:save', (_event, nextConfig, options) => saveConfig(nextConfig, options));
   ipcMain.handle('shortcut:send', (_event, shortcut) => sendShortcut(shortcut));
   ipcMain.handle('shortcut:sendSequence', (_event, shortcuts) => sendShortcutSequence(shortcuts));
   ipcMain.handle('shortcut:startRepeat', (_event, shortcut) => startRepeatShortcut(shortcut));

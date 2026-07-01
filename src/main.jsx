@@ -8,6 +8,17 @@ const MODIFIER_ONLY_COMMIT_MS = 700;
 const DELETE_TO_HEAD_SEQUENCE = ['Ctrl+Shift+Home', 'Backspace'];
 const VOICE_MODE_ORDER = ['wechat', 'lightning'];
 const DeleteToHeadIcon = Icons.ArrowLeftToLine || Icons.CornerUpLeft || Icons.Delete;
+const PUNCTUATION_TOOL_ITEMS = [
+  { id: 'copy', label: '复制', icon: 'Copy', shortcut: 'Ctrl+C' },
+  { id: 'paste', label: '粘贴', icon: 'ClipboardPaste', shortcut: 'Ctrl+V' },
+  { id: 'cut', label: '剪切', icon: 'Scissors', shortcut: 'Ctrl+X' }
+];
+const defaultPunctuationItems = [
+  { id: 'comma', label: '逗号', text: '，' },
+  { id: 'period', label: '句号', text: '。' },
+  { id: 'exclamation', label: '感叹号', text: '！' },
+  { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
+];
 
 const defaultVoiceModes = {
   activeId: 'lightning',
@@ -32,12 +43,14 @@ const defaultVoiceModes = {
 };
 
 const previewConfig = {
-  schemaVersion: 2,
+  schemaVersion: 4,
   buttons: [
+    { id: 'punctuation', label: '标点', iconType: 'lucide', icon: 'Braces', image: '', shortcut: '' },
     { id: 'voice', label: '语音', iconType: 'lucide', icon: 'Mic', image: '', shortcut: 'Ctrl+I' },
     { id: 'send', label: '发送', iconType: 'lucide', icon: 'SendHorizontal', image: '', shortcut: 'Enter' },
     { id: 'delete', label: '删除', iconType: 'lucide', icon: 'Delete', image: '', shortcut: 'Backspace' }
   ],
+  punctuationItems: defaultPunctuationItems,
   voiceModes: defaultVoiceModes,
   window: { corner: 'bottom-right', buttonSize: 64, gap: 10, opacity: 0.78 }
 };
@@ -94,9 +107,11 @@ function FloatingPanel() {
   const longPressTriggeredRef = useRef(false);
   const pressedButtonRef = useRef(null);
   const deleteHeadRef = useRef(null);
+  const sideActionRequestRef = useRef(0);
 
   useEffect(() => {
     return () => {
+      sideActionRequestRef.current += 1;
       stopRepeat();
       api.setSideActionsOpen(false);
     };
@@ -116,9 +131,29 @@ function FloatingPanel() {
   };
 
   function setSideActionType(type) {
-    setSideActionTypeState(type);
+    const nextType = type || null;
+    const requestId = sideActionRequestRef.current + 1;
+    sideActionRequestRef.current = requestId;
     setDeleteHeadArmed(false);
-    api.setSideActionsOpen(Boolean(type));
+
+    if (nextType) {
+      api.setSideActionsOpen(true).finally(() => {
+        if (sideActionRequestRef.current !== requestId) return;
+        window.requestAnimationFrame(() => {
+          if (sideActionRequestRef.current === requestId) {
+            setSideActionTypeState(nextType);
+          }
+        });
+      });
+      return;
+    }
+
+    setSideActionTypeState(null);
+    window.requestAnimationFrame(() => {
+      if (sideActionRequestRef.current === requestId) {
+        api.setSideActionsOpen(false);
+      }
+    });
   }
 
   function pulse(id) {
@@ -138,6 +173,12 @@ function FloatingPanel() {
       return;
     }
 
+    if (isPunctuationButton(button)) {
+      pulse(button.id);
+      setSideActionType(sideActionType === 'punctuation' ? null : 'punctuation');
+      return;
+    }
+
     await triggerShortcut(button.id, button.shortcut);
   }
 
@@ -146,9 +187,17 @@ function FloatingPanel() {
     await api.sendShortcutSequence(DELETE_TO_HEAD_SEQUENCE);
   }
 
-  function openVoiceSelector(button) {
+  function previewPunctuationItem(item) {
+    pulse(`punctuation:${item.id}`);
+  }
+
+  function previewPunctuationTool(tool) {
+    pulse(`punctuation:${tool.id}`);
+  }
+
+  function openVoiceSelector(button, options = {}) {
     longPressTriggeredRef.current = true;
-    pulse(button.id);
+    if (options.pulseButton !== false) pulse(button.id);
     setSideActionType('voice');
   }
 
@@ -169,7 +218,12 @@ function FloatingPanel() {
     pressedButtonRef.current = null;
 
     if (isVoiceButton(button)) {
-      openVoiceSelector(button);
+      openVoiceSelector(button, { pulseButton: false });
+      return;
+    }
+
+    if (isPunctuationButton(button)) {
+      setSideActionType(sideActionType === 'punctuation' ? null : 'punctuation');
       return;
     }
 
@@ -292,7 +346,7 @@ function FloatingPanel() {
         activeId: modeId
       }
     };
-    const saved = await api.saveConfig(nextConfig);
+    const saved = await api.saveConfig(nextConfig, { preserveFloatingBounds: true });
     setConfig(saved);
     setSideActionType(null);
   }
@@ -300,7 +354,7 @@ function FloatingPanel() {
   function renderSideActions() {
     if (!sideActionType) return null;
 
-    const targetId = sideActionType === 'voice' ? 'voice' : 'delete';
+    const targetId = sideActionType === 'voice' ? 'voice' : sideActionType === 'punctuation' ? 'punctuation' : 'delete';
     const rowIndex = Math.max(buttons.findIndex((button) => button.id === targetId), 0);
     const top = 12 + rowIndex * (buttonSize + config.window.gap) + buttonSize / 2;
 
@@ -326,6 +380,43 @@ function FloatingPanel() {
       );
     }
 
+    if (sideActionType === 'punctuation') {
+      return (
+        <div className="side-action-column punctuation-panel" onPointerDown={(event) => event.stopPropagation()}>
+          <div className="punctuation-tool-column">
+            {PUNCTUATION_TOOL_ITEMS.map((tool) => {
+              const ToolIcon = Icons[tool.icon] || Icons.Circle;
+              return (
+                <button
+                  key={tool.id}
+                  type="button"
+                  className="side-action-button punctuation-action punctuation-tool-action"
+                  title={tool.label}
+                  aria-label={tool.label}
+                  onClick={() => previewPunctuationTool(tool)}
+                >
+                  <ToolIcon size={Math.round(sideButtonSize * 0.38)} strokeWidth={2.4} />
+                </button>
+              );
+            })}
+          </div>
+          <div className="punctuation-mark-column">
+            {getPunctuationItems(config).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className="side-action-button punctuation-action"
+                title={item.label}
+                onClick={() => previewPunctuationItem(item)}
+              >
+                <span className="punctuation-glyph">{item.text}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="side-action-row" style={{ top: `${top}px` }}>
         <button
@@ -347,7 +438,7 @@ function FloatingPanel() {
         event.preventDefault();
       }}
       onPointerDown={(event) => {
-        if (event.target === event.currentTarget && sideActionType === 'voice') setSideActionType(null);
+        if (event.target === event.currentTarget && sideActionType) setSideActionType(null);
       }}
     >
       <div className="floating-layout" style={style}>
@@ -902,7 +993,26 @@ function getActiveVoiceMode(config) {
   return voiceModes.options[voiceModes.activeId] || voiceModes.options.lightning;
 }
 
+function getPunctuationItems(config) {
+  const items = Array.isArray(config.punctuationItems) && config.punctuationItems.length
+    ? config.punctuationItems
+    : defaultPunctuationItems;
+
+  return items
+    .map((item, index) => ({
+      id: item.id || `punctuation-${index}`,
+      label: item.label || `标点 ${index + 1}`,
+      text: item.text || '',
+      afterShortcut: item.afterShortcut || ''
+    }))
+    .filter((item) => item.text);
+}
+
 function shortcutLabelForButton(button, config) {
+  if (isPunctuationButton(button)) {
+    return '标点面板';
+  }
+
   if (isVoiceButton(button)) {
     const activeMode = getActiveVoiceMode(config);
     return `${activeMode.label} · ${activeMode.shortcut || '未设置'}`;
@@ -912,6 +1022,10 @@ function shortcutLabelForButton(button, config) {
 }
 
 function buttonTitle(button, config) {
+  if (isPunctuationButton(button)) {
+    return `${button.label} · 标点面板`;
+  }
+
   if (isVoiceButton(button)) {
     const activeMode = getActiveVoiceMode(config);
     return `${button.label} · ${activeMode.label} · ${activeMode.shortcut || '未设置'}`;
@@ -922,6 +1036,10 @@ function buttonTitle(button, config) {
 
 function isVoiceButton(button) {
   return button.id === 'voice';
+}
+
+function isPunctuationButton(button) {
+  return button.id === 'punctuation';
 }
 
 function isRepeatDeleteButton(button) {

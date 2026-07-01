@@ -94,6 +94,32 @@ button {
   -webkit-app-region: no-drag;
 }
 
+.side-action-column {
+  position: absolute;
+  right: calc(var(--button-size) + 24px + var(--button-gap));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(var(--button-gap) * 0.75);
+  z-index: 3;
+  -webkit-app-region: no-drag;
+}
+
+.side-action-column.punctuation-panel {
+  top: 12px;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.punctuation-tool-column,
+.punctuation-mark-column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+
 .side-action-button {
   width: var(--side-button-size);
   height: var(--side-button-size);
@@ -208,6 +234,23 @@ button {
   object-fit: contain;
   pointer-events: none;
   user-select: none;
+}
+
+.side-action-button.punctuation-action {
+  width: min(var(--side-button-size), 40px);
+  height: min(var(--side-button-size), 40px);
+  color: rgba(26, 38, 54, 0.9);
+}
+
+.side-action-button.punctuation-tool-action {
+  color: rgba(45, 62, 82, 0.86);
+}
+
+.punctuation-glyph {
+  color: currentColor;
+  font-size: 20px;
+  font-weight: 760;
+  line-height: 1;
 }
 
 .settings-stage {
