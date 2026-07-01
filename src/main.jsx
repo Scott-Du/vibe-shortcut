@@ -11,7 +11,7 @@ const VOICE_MODE_ORDER = ['wechat', 'lightning'];
 const DeleteToHeadIcon = Icons.ArrowLeftToLine || Icons.CornerUpLeft || Icons.Delete;
 const PUNCTUATION_TOOL_ITEMS = [
   { id: 'copy', label: '复制', icon: 'Copy', shortcut: 'Ctrl+C' },
-  { id: 'paste', label: '粘贴', icon: 'ClipboardPaste', shortcut: 'Ctrl+V' },
+  { id: 'paste', label: '粘贴', icon: 'Clipboard', shortcut: 'Ctrl+V' },
   { id: 'cut', label: '剪切', icon: 'Scissors', shortcut: 'Ctrl+X' }
 ];
 const defaultPunctuationItems = [
@@ -19,6 +19,56 @@ const defaultPunctuationItems = [
   { id: 'period', label: '句号', text: '。' },
   { id: 'exclamation', label: '感叹号', text: '！' },
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
+];
+const defaultDisplayPresets = [
+  { id: 'preset-1', label: '设置一', width: 0, height: 0, scale: 175, orientation: 'portrait' },
+  { id: 'preset-2', label: '设置二', width: 0, height: 0, scale: 100, orientation: 'landscape' }
+];
+const SETTINGS_SECTIONS = [
+  { id: 'buttons', label: '按钮' },
+  { id: 'voice', label: '语音' },
+  { id: 'punctuation', label: '标点' },
+  { id: 'appearance', label: '外观' },
+  { id: 'display', label: '屏幕' },
+  { id: 'system', label: '系统' }
+];
+const ICON_PICKER_ITEMS = [
+  { icon: 'Mic', label: '话筒' },
+  { icon: 'SendHorizontal', label: '发送' },
+  { icon: 'Delete', label: '删除' },
+  { icon: 'Braces', label: '标点' },
+  { icon: 'Keyboard', label: '键盘' },
+  { icon: 'MessageCircle', label: '消息' },
+  { icon: 'Zap', label: '闪电' },
+  { icon: 'Clipboard', label: '粘贴' },
+  { icon: 'Copy', label: '复制' },
+  { icon: 'Scissors', label: '剪切' },
+  { icon: 'MousePointerClick', label: '点击' },
+  { icon: 'Settings', label: '设置' },
+  { icon: 'Monitor', label: '屏幕' },
+  { icon: 'TabletSmartphone', label: '平板' },
+  { icon: 'Command', label: '命令' },
+  { icon: 'CornerDownLeft', label: '回车' },
+  { icon: 'CornerUpLeft', label: '撤回' },
+  { icon: 'Trash2', label: '清理' },
+  { icon: 'Search', label: '搜索' },
+  { icon: 'Plus', label: '增加' },
+  { icon: 'Minus', label: '减少' },
+  { icon: 'Home', label: '主页' },
+  { icon: 'User', label: '用户' },
+  { icon: 'PenLine', label: '编辑' },
+  { icon: 'FileText', label: '文档' },
+  { icon: 'Image', label: '图片' },
+  { icon: 'Camera', label: '相机' },
+  { icon: 'Volume2', label: '音量' },
+  { icon: 'Headphones', label: '耳机' },
+  { icon: 'Bot', label: '智能' },
+  { icon: 'Sparkles', label: '灵感' },
+  { icon: 'Star', label: '星标' },
+  { icon: 'Heart', label: '喜欢' },
+  { icon: 'Bell', label: '提醒' },
+  { icon: 'Circle', label: '圆形' },
+  { icon: 'Square', label: '方形' }
 ];
 
 const defaultVoiceModes = {
@@ -44,7 +94,7 @@ const defaultVoiceModes = {
 };
 
 const previewConfig = {
-  schemaVersion: 4,
+  schemaVersion: 5,
   buttons: [
     { id: 'punctuation', label: '标点', iconType: 'lucide', icon: 'Braces', image: '', shortcut: '' },
     { id: 'voice', label: '语音', iconType: 'lucide', icon: 'Mic', image: '', shortcut: 'Ctrl+I' },
@@ -52,6 +102,7 @@ const previewConfig = {
     { id: 'delete', label: '删除', iconType: 'lucide', icon: 'Delete', image: '', shortcut: 'Backspace' }
   ],
   punctuationItems: defaultPunctuationItems,
+  displayPresets: defaultDisplayPresets,
   voiceModes: defaultVoiceModes,
   window: { corner: 'bottom-right', buttonSize: 64, gap: 10, opacity: 0.78 }
 };
@@ -554,16 +605,20 @@ function FloatingPanel() {
 function SettingsApp() {
   const [config, setConfig] = useConfig();
   const [draft, setDraft] = useState(null);
-  const [selectedId, setSelectedId] = useState(null);
+  const [activeSection, setActiveSection] = useState('buttons');
   const [recordingId, setRecordingId] = useState(null);
+  const [iconPicker, setIconPicker] = useState(null);
+  const [iconSearch, setIconSearch] = useState('');
   const [startup, setStartup] = useState({ enabled: false, supported: false });
   const recorderRef = useRef(null);
   const modifierRecordTimerRef = useRef(null);
+  const draftReadyRef = useRef(false);
+  const saveRequestRef = useRef(0);
 
   useEffect(() => {
-    if (!config) return;
+    if (!config || draftReadyRef.current) return;
     setDraft(config);
-    setSelectedId((current) => current || config.buttons[0]?.id || null);
+    draftReadyRef.current = true;
   }, [config]);
 
   useEffect(() => {
@@ -633,11 +688,30 @@ function SettingsApp() {
 
   if (!draft) return null;
 
-  const selectedButton = draft.buttons.find((button) => button.id === selectedId) || draft.buttons[0];
+  const buttons = Array.isArray(draft.buttons) ? draft.buttons : [];
   const voiceModes = getVoiceModes(draft);
+  const punctuationItems = getEditablePunctuationItems(draft);
+  const displayPresets = getEditableDisplayPresets(draft);
+
+  function commitDraft(updater, options) {
+    setDraft((current) => {
+      if (!current) return current;
+      const nextDraft = typeof updater === 'function' ? updater(current) : updater;
+      const requestId = saveRequestRef.current + 1;
+      saveRequestRef.current = requestId;
+      api.saveConfig(nextDraft, options).then((saved) => {
+        if (saveRequestRef.current !== requestId) return;
+        setConfig(saved);
+        setDraft(saved);
+      }).catch((error) => {
+        console.error('Failed to save config', error);
+      });
+      return nextDraft;
+    });
+  }
 
   function setWindowPatch(patch) {
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       window: {
         ...current.window,
@@ -647,14 +721,14 @@ function SettingsApp() {
   }
 
   function updateButton(id, patch) {
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       buttons: current.buttons.map((button) => (button.id === id ? { ...button, ...patch } : button))
     }));
   }
 
   function updateVoiceMode(id, patch) {
-    setDraft((current) => {
+    commitDraft((current) => {
       const currentVoiceModes = getVoiceModes(current);
       return {
         ...current,
@@ -673,7 +747,7 @@ function SettingsApp() {
   }
 
   function setActiveVoiceMode(id) {
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       voiceModes: {
         ...getVoiceModes(current),
@@ -688,40 +762,35 @@ function SettingsApp() {
       id,
       label: '新按钮',
       iconType: 'lucide',
-      icon: 'Sparkle',
+      icon: 'Sparkles',
       image: '',
       shortcut: 'Ctrl+I'
     };
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       buttons: [...current.buttons, nextButton]
     }));
-    setSelectedId(id);
   }
 
-  function removeSelectedButton() {
-    if (!selectedButton || draft.buttons.length <= 1) return;
-    const nextButtons = draft.buttons.filter((button) => button.id !== selectedButton.id);
-    setDraft((current) => ({ ...current, buttons: nextButtons }));
-    setSelectedId(nextButtons[0]?.id || null);
+  function removeButton(id) {
+    if (buttons.length <= 1) return;
+    commitDraft((current) => ({
+      ...current,
+      buttons: current.buttons.filter((button) => button.id !== id)
+    }));
   }
 
-  function moveSelectedButton(direction) {
-    if (!selectedButton) return;
-    const index = draft.buttons.findIndex((button) => button.id === selectedButton.id);
-    const nextIndex = index + direction;
-    if (nextIndex < 0 || nextIndex >= draft.buttons.length) return;
-    const nextButtons = [...draft.buttons];
-    const [item] = nextButtons.splice(index, 1);
-    nextButtons.splice(nextIndex, 0, item);
-    setDraft((current) => ({ ...current, buttons: nextButtons }));
+  function moveButton(id, direction) {
+    commitDraft((current) => ({
+      ...current,
+      buttons: moveById(current.buttons, id, direction)
+    }));
   }
 
-  async function chooseButtonImage() {
-    if (!selectedButton) return;
+  async function chooseButtonImage(id) {
     const image = await api.chooseImage();
     if (image) {
-      updateButton(selectedButton.id, { iconType: 'image', image });
+      updateButton(id, { iconType: 'image', image });
     }
   }
 
@@ -732,14 +801,604 @@ function SettingsApp() {
     }
   }
 
-  async function save() {
-    const saved = await api.saveConfig(draft);
-    setDraft(saved);
+  function addPunctuationItem() {
+    const id = `punctuation-${Date.now()}`;
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: [
+        ...getEditablePunctuationItems(current),
+        { id, label: '新标点', text: '', afterShortcut: '' }
+      ]
+    }));
+  }
+
+  function updatePunctuationItem(id, patch) {
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: getEditablePunctuationItems(current).map((item) => (
+        item.id === id ? { ...item, ...patch } : item
+      ))
+    }));
+  }
+
+  function removePunctuationItem(id) {
+    if (punctuationItems.length <= 1) return;
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: getEditablePunctuationItems(current).filter((item) => item.id !== id)
+    }));
+  }
+
+  function movePunctuationItem(id, direction) {
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: moveById(getEditablePunctuationItems(current), id, direction)
+    }));
+  }
+
+  function addDisplayPreset() {
+    const id = `preset-${Date.now()}`;
+    const index = displayPresets.length + 1;
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: [
+        ...getEditableDisplayPresets(current),
+        { id, label: `设置${index}`, width: 0, height: 0, scale: 100, orientation: 'landscape' }
+      ]
+    }));
+  }
+
+  function updateDisplayPreset(id, patch) {
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: getEditableDisplayPresets(current).map((preset) => (
+        preset.id === id ? { ...preset, ...patch } : preset
+      ))
+    }));
+  }
+
+  function removeDisplayPreset(id) {
+    if (displayPresets.length <= 1) return;
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: getEditableDisplayPresets(current).filter((preset) => preset.id !== id)
+    }));
+  }
+
+  function moveDisplayPreset(id, direction) {
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: moveById(getEditableDisplayPresets(current), id, direction)
+    }));
+  }
+
+  function restoreDefaults() {
+    commitDraft(previewConfig);
+  }
+
+  function openIconPicker(targetType, id, currentIcon) {
+    setIconSearch('');
+    setIconPicker({ targetType, id, currentIcon: currentIcon || 'Circle' });
+  }
+
+  function closeIconPicker() {
+    setIconPicker(null);
+  }
+
+  function chooseLucideIcon(iconName) {
+    if (!iconPicker) return;
+    if (iconPicker.targetType === 'voice') {
+      updateVoiceMode(iconPicker.id, { iconType: 'lucide', icon: iconName });
+    } else {
+      updateButton(iconPicker.id, { iconType: 'lucide', icon: iconName });
+    }
+    closeIconPicker();
+  }
+
+  function renderIconSelect(iconName, onClick) {
+    const label = iconLabel(iconName);
+    return (
+      <button type="button" className="icon-select-button" onClick={onClick}>
+        <span className="icon-select-preview">
+          <LucideIcon name={iconName} size={20} />
+        </span>
+        <span className="icon-select-copy">
+          <strong>{label}</strong>
+          <small>{iconName || 'Circle'}</small>
+        </span>
+        <Icons.ChevronDown size={16} />
+      </button>
+    );
+  }
+
+  function renderIconPicker() {
+    if (!iconPicker) return null;
+    const query = iconSearch.trim().toLowerCase();
+    const filteredIcons = ICON_PICKER_ITEMS.filter((item) => (
+      !query ||
+      item.icon.toLowerCase().includes(query) ||
+      item.label.toLowerCase().includes(query)
+    ));
+
+    return (
+      <div
+        className="icon-picker-backdrop"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) closeIconPicker();
+        }}
+      >
+        <div className="icon-picker" role="dialog" aria-label="选择图标">
+          <div className="icon-picker-header">
+            <strong>选择图标</strong>
+            <button type="button" onClick={closeIconPicker} title="关闭">
+              <Icons.X size={16} />
+            </button>
+          </div>
+          <label className="icon-picker-search">
+            <Icons.Search size={15} />
+            <input
+              value={iconSearch}
+              onChange={(event) => setIconSearch(event.target.value)}
+              placeholder="搜索图标"
+              autoFocus
+            />
+          </label>
+          <div className="icon-picker-grid">
+            {filteredIcons.map((item) => (
+              <button
+                key={item.icon}
+                type="button"
+                className={`icon-picker-item ${item.icon === iconPicker.currentIcon ? 'is-selected' : ''}`}
+                onClick={() => chooseLucideIcon(item.icon)}
+                title={`${item.label} · ${item.icon}`}
+              >
+                <LucideIcon name={item.icon} size={21} />
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   async function toggleStartup(event) {
     const nextStartup = await api.setStartup(event.target.checked);
     setStartup(nextStartup);
+  }
+
+  function renderButtonsSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>按钮</h2>
+            <p>悬浮框里的主按钮</p>
+          </div>
+          <button className="small-icon-button" type="button" onClick={addButton} title="新增按钮">
+            <Icons.Plus size={17} />
+          </button>
+        </div>
+
+        <div className="button-config-list">
+          {buttons.map((button, index) => {
+            const recording = recordingId === `button:${button.id}`;
+            return (
+              <div className="button-config-card" key={button.id}>
+                <div className="item-config-header">
+                  <span className="button-list-icon">
+                    <ButtonIcon button={button} size={18} />
+                  </span>
+                  <strong>{button.label || `按钮 ${index + 1}`}</strong>
+                  <div className="row-actions">
+                    <button type="button" onClick={() => moveButton(button.id, -1)} title="上移" disabled={index === 0}>
+                      <Icons.ArrowUp size={15} />
+                    </button>
+                    <button type="button" onClick={() => moveButton(button.id, 1)} title="下移" disabled={index === buttons.length - 1}>
+                      <Icons.ArrowDown size={15} />
+                    </button>
+                    <button type="button" onClick={() => removeButton(button.id)} title="删除按钮" disabled={buttons.length <= 1}>
+                      <Icons.Trash2 size={15} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="field-row">
+                  <label className="field">
+                    <span>名称</span>
+                    <input
+                      value={button.label}
+                      onChange={(event) => updateButton(button.id, { label: event.target.value })}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>图标类型</span>
+                    <select
+                      value={button.iconType}
+                      onChange={(event) => updateButton(button.id, { iconType: event.target.value })}
+                    >
+                      <option value="lucide">内置图标</option>
+                      <option value="image">自定义图片</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="field-row">
+                  {button.iconType === 'lucide' ? (
+                    <div className="field">
+                      <span>图标</span>
+                      {renderIconSelect(button.icon, () => openIconPicker('button', button.id, button.icon))}
+                    </div>
+                  ) : (
+                    <div className="field image-field">
+                      <span>图片</span>
+                      <button type="button" onClick={() => chooseButtonImage(button.id)}>
+                        <Icons.ImagePlus size={16} />
+                        选择图片
+                      </button>
+                    </div>
+                  )}
+
+                  <label className="field">
+                    <span>快捷键</span>
+                    <div className="inline-recorder">
+                      <strong>{shortcutLabelForButton(button, draft)}</strong>
+                      <button
+                        ref={recording ? recorderRef : null}
+                        type="button"
+                        className={recording ? 'is-recording' : ''}
+                        onClick={() => setRecordingId(`button:${button.id}`)}
+                      >
+                        {recording ? '按键中' : '录制'}
+                      </button>
+                    </div>
+                  </label>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  function renderVoiceSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>语音</h2>
+            <p>语音输入法模式</p>
+          </div>
+        </div>
+
+        <div className="voice-mode-list">
+          {VOICE_MODE_ORDER.map((modeId) => {
+            const voiceMode = voiceModes.options[modeId];
+            const selected = voiceModes.activeId === modeId;
+            const recording = recordingId === `voice:${modeId}`;
+            return (
+              <div key={modeId} className={`voice-mode-card ${selected ? 'is-selected' : ''}`}>
+                <button
+                  type="button"
+                  className="voice-mode-selector"
+                  onClick={() => setActiveVoiceMode(modeId)}
+                  title="设为当前语音模式"
+                >
+                  <ButtonIcon button={voiceMode} size={22} />
+                </button>
+
+                <div className="voice-mode-fields">
+                  <div className="field-row">
+                    <label className="field">
+                      <span>名称</span>
+                      <input
+                        value={voiceMode.label}
+                        onChange={(event) => updateVoiceMode(modeId, { label: event.target.value })}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>快捷键</span>
+                      <div className="inline-recorder">
+                        <strong>{voiceMode.shortcut || '未设置'}</strong>
+                        <button
+                          ref={recording ? recorderRef : null}
+                          type="button"
+                          className={recording ? 'is-recording' : ''}
+                          onClick={() => setRecordingId(`voice:${modeId}`)}
+                        >
+                          {recording ? '按键中' : '录制'}
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+
+                  <div className="field-row">
+                    <label className="field">
+                      <span>图标类型</span>
+                      <select
+                        value={voiceMode.iconType}
+                        onChange={(event) => updateVoiceMode(modeId, { iconType: event.target.value })}
+                      >
+                        <option value="lucide">内置图标</option>
+                        <option value="image">自定义图片</option>
+                      </select>
+                    </label>
+                    {voiceMode.iconType === 'lucide' ? (
+                      <div className="field">
+                        <span>图标</span>
+                        {renderIconSelect(voiceMode.icon, () => openIconPicker('voice', modeId, voiceMode.icon))}
+                      </div>
+                    ) : (
+                      <div className="field image-field">
+                        <span>图片</span>
+                        <button type="button" onClick={() => chooseVoiceModeImage(modeId)}>
+                          <Icons.ImagePlus size={16} />
+                          选择图片
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  function renderPunctuationSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>标点</h2>
+            <p>标点面板里的可选项</p>
+          </div>
+          <button className="small-icon-button" type="button" onClick={addPunctuationItem} title="新增标点">
+            <Icons.Plus size={17} />
+          </button>
+        </div>
+
+        <div className="punctuation-config-list">
+          {punctuationItems.map((item, index) => (
+            <div className="punctuation-config-row" key={item.id}>
+              <div className="punctuation-preview">{item.text || '·'}</div>
+              <label className="field">
+                <span>名称</span>
+                <input
+                  value={item.label}
+                  onChange={(event) => updatePunctuationItem(item.id, { label: event.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span>输入内容</span>
+                <input
+                  value={item.text}
+                  onChange={(event) => updatePunctuationItem(item.id, { text: event.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span>插入后</span>
+                <select
+                  value={item.afterShortcut || ''}
+                  onChange={(event) => updatePunctuationItem(item.id, { afterShortcut: event.target.value })}
+                >
+                  <option value="">不移动</option>
+                  <option value="Left">光标左移</option>
+                </select>
+              </label>
+              <div className="row-actions">
+                <button type="button" onClick={() => movePunctuationItem(item.id, -1)} title="上移" disabled={index === 0}>
+                  <Icons.ArrowUp size={15} />
+                </button>
+                <button type="button" onClick={() => movePunctuationItem(item.id, 1)} title="下移" disabled={index === punctuationItems.length - 1}>
+                  <Icons.ArrowDown size={15} />
+                </button>
+                <button type="button" onClick={() => removePunctuationItem(item.id)} title="删除标点" disabled={punctuationItems.length <= 1}>
+                  <Icons.Trash2 size={15} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function renderAppearanceSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>外观</h2>
+            <p>悬浮框显示样式</p>
+          </div>
+        </div>
+
+        <div className="form-section">
+          <div className="field-row">
+            <label className="field">
+              <span>角落</span>
+              <select value={draft.window.corner} onChange={(event) => setWindowPatch({ corner: event.target.value })}>
+                <option value="top-right">右上</option>
+                <option value="top-left">左上</option>
+                <option value="bottom-right">右下</option>
+                <option value="bottom-left">左下</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>按钮大小 {draft.window.buttonSize}px</span>
+              <input
+                type="range"
+                min="48"
+                max="112"
+                value={draft.window.buttonSize}
+                onChange={(event) => setWindowPatch({ buttonSize: Number(event.target.value) })}
+              />
+            </label>
+          </div>
+
+          <div className="field-row">
+            <label className="field">
+              <span>透明度 {Math.round(draft.window.opacity * 100)}%</span>
+              <input
+                type="range"
+                min="25"
+                max="100"
+                value={Math.round(draft.window.opacity * 100)}
+                onChange={(event) => setWindowPatch({ opacity: Number(event.target.value) / 100 })}
+              />
+            </label>
+            <label className="field">
+              <span>间距 {draft.window.gap}px</span>
+              <input
+                type="range"
+                min="4"
+                max="24"
+                value={draft.window.gap}
+                onChange={(event) => setWindowPatch({ gap: Number(event.target.value) })}
+              />
+            </label>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderDisplaySection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>屏幕</h2>
+            <p>托盘左键菜单预设</p>
+          </div>
+          <button className="small-icon-button" type="button" onClick={addDisplayPreset} title="新增屏幕预设">
+            <Icons.Plus size={17} />
+          </button>
+        </div>
+
+        <div className="display-preset-list">
+          {displayPresets.map((preset, index) => (
+            <div className="display-preset-card" key={preset.id}>
+              <div className="item-config-header">
+                <strong>{preset.label || `设置${index + 1}`}</strong>
+                <div className="row-actions">
+                  <button type="button" onClick={() => moveDisplayPreset(preset.id, -1)} title="上移" disabled={index === 0}>
+                    <Icons.ArrowUp size={15} />
+                  </button>
+                  <button type="button" onClick={() => moveDisplayPreset(preset.id, 1)} title="下移" disabled={index === displayPresets.length - 1}>
+                    <Icons.ArrowDown size={15} />
+                  </button>
+                  <button type="button" onClick={() => removeDisplayPreset(preset.id)} title="删除预设" disabled={displayPresets.length <= 1}>
+                    <Icons.Trash2 size={15} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="field-row">
+                <label className="field">
+                  <span>名称</span>
+                  <input
+                    value={preset.label}
+                    onChange={(event) => updateDisplayPreset(preset.id, { label: event.target.value })}
+                  />
+                </label>
+                <label className="field">
+                  <span>方向</span>
+                  <select
+                    value={preset.orientation}
+                    onChange={(event) => updateDisplayPreset(preset.id, { orientation: event.target.value })}
+                  >
+                    <option value="landscape">横向</option>
+                    <option value="portrait">纵向</option>
+                    <option value="landscape-flipped">横向翻转</option>
+                    <option value="portrait-flipped">纵向翻转</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="field-row three-columns">
+                <label className="field">
+                  <span>缩放</span>
+                  <input
+                    type="number"
+                    min="100"
+                    max="350"
+                    value={preset.scale}
+                    onChange={(event) => updateDisplayPreset(preset.id, { scale: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="field">
+                  <span>宽度</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={preset.width}
+                    onChange={(event) => updateDisplayPreset(preset.id, { width: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="field">
+                  <span>高度</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={preset.height}
+                    onChange={(event) => updateDisplayPreset(preset.id, { height: Number(event.target.value) })}
+                  />
+                </label>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function renderSystemSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>系统</h2>
+            <p>Windows 启动行为</p>
+          </div>
+        </div>
+
+        <div className="form-section">
+          <label className={`switch-field ${startup.supported ? '' : 'is-disabled'}`}>
+            <span>
+              <strong>开机自启动</strong>
+              <small>{startup.supported ? '跟随 Windows 登录启动' : '打包版中可用'}</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={startup.enabled}
+              disabled={!startup.supported}
+              onChange={toggleStartup}
+            />
+          </label>
+        </div>
+
+        <div className="form-section">
+          <button type="button" className="danger-ghost-button" onClick={restoreDefaults}>
+            <Icons.RotateCcw size={16} />
+            全部恢复默认
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderActiveSection() {
+    if (activeSection === 'voice') return renderVoiceSection();
+    if (activeSection === 'punctuation') return renderPunctuationSection();
+    if (activeSection === 'appearance') return renderAppearanceSection();
+    if (activeSection === 'display') return renderDisplaySection();
+    if (activeSection === 'system') return renderSystemSection();
+    return renderButtonsSection();
   }
 
   return (
@@ -756,265 +1415,24 @@ function SettingsApp() {
         </header>
 
         <div className="settings-grid">
-          <aside className="button-list-panel">
-            <div className="panel-heading">
-              <span>按钮</span>
-              <button className="small-icon-button" type="button" onClick={addButton} title="新增按钮">
-                <Icons.Plus size={17} />
+          <aside className="settings-nav" aria-label="设置分类">
+            {SETTINGS_SECTIONS.map((section) => (
+              <button
+                key={section.id}
+                type="button"
+                className={`settings-nav-button ${activeSection === section.id ? 'is-selected' : ''}`}
+                onClick={() => setActiveSection(section.id)}
+              >
+                {section.label}
               </button>
-            </div>
-
-            <div className="button-list">
-              {draft.buttons.map((button) => (
-                <button
-                  key={button.id}
-                  type="button"
-                  className={`button-list-item ${button.id === selectedButton?.id ? 'is-selected' : ''}`}
-                  onClick={() => setSelectedId(button.id)}
-                >
-                  <span className="button-list-icon">
-                    <ButtonIcon button={button} size={18} />
-                  </span>
-                  <span className="button-list-copy">
-                    <strong>{button.label}</strong>
-                    <small>{shortcutLabelForButton(button, draft)}</small>
-                  </span>
-                </button>
-              ))}
-            </div>
-
-            <div className="list-actions">
-              <button type="button" onClick={() => moveSelectedButton(-1)} title="上移">
-                <Icons.ArrowUp size={16} />
-              </button>
-              <button type="button" onClick={() => moveSelectedButton(1)} title="下移">
-                <Icons.ArrowDown size={16} />
-              </button>
-              <button type="button" onClick={removeSelectedButton} title="删除按钮" disabled={draft.buttons.length <= 1}>
-                <Icons.Trash2 size={16} />
-              </button>
-            </div>
+            ))}
           </aside>
 
           <section className="editor-panel">
-            {selectedButton ? (
-              <>
-                <div className="form-section">
-                  <h2>按钮内容</h2>
-                  <label className="field">
-                    <span>名称</span>
-                    <input
-                      value={selectedButton.label}
-                      onChange={(event) => updateButton(selectedButton.id, { label: event.target.value })}
-                    />
-                  </label>
-
-                  <div className="field-row">
-                    <label className="field">
-                      <span>图标类型</span>
-                      <select
-                        value={selectedButton.iconType}
-                        onChange={(event) => updateButton(selectedButton.id, { iconType: event.target.value })}
-                      >
-                        <option value="lucide">内置图标</option>
-                        <option value="image">自定义图片</option>
-                      </select>
-                    </label>
-
-                    {selectedButton.iconType === 'lucide' ? (
-                      <label className="field">
-                        <span>Lucide 图标名</span>
-                        <input
-                          value={selectedButton.icon}
-                          onChange={(event) => updateButton(selectedButton.id, { icon: event.target.value })}
-                          placeholder="Mic"
-                        />
-                      </label>
-                    ) : (
-                      <div className="field image-field">
-                        <span>图片</span>
-                        <button type="button" onClick={chooseButtonImage}>
-                          <Icons.ImagePlus size={16} />
-                          选择图片
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>快捷键</h2>
-                  <div className="shortcut-recorder">
-                    <div>
-                      <span>当前</span>
-                      <strong>{shortcutLabelForButton(selectedButton, draft)}</strong>
-                    </div>
-                    <button
-                      ref={recorderRef}
-                      type="button"
-                      className={recordingId === `button:${selectedButton.id}` ? 'is-recording' : ''}
-                      onClick={() => setRecordingId(`button:${selectedButton.id}`)}
-                    >
-                      {recordingId === `button:${selectedButton.id}` ? '按下快捷键...' : '录制快捷键'}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>语音模式</h2>
-                  <div className="voice-mode-list">
-                    {VOICE_MODE_ORDER.map((modeId) => {
-                      const voiceMode = voiceModes.options[modeId];
-                      const selected = voiceModes.activeId === modeId;
-                      const recording = recordingId === `voice:${modeId}`;
-                      return (
-                        <div key={modeId} className={`voice-mode-card ${selected ? 'is-selected' : ''}`}>
-                          <button
-                            type="button"
-                            className="voice-mode-selector"
-                            onClick={() => setActiveVoiceMode(modeId)}
-                            title="设为当前语音模式"
-                          >
-                            <ButtonIcon button={voiceMode} size={22} />
-                          </button>
-
-                          <div className="voice-mode-fields">
-                            <div className="field-row">
-                              <label className="field">
-                                <span>名称</span>
-                                <input
-                                  value={voiceMode.label}
-                                  onChange={(event) => updateVoiceMode(modeId, { label: event.target.value })}
-                                />
-                              </label>
-                              <label className="field">
-                                <span>快捷键</span>
-                                <div className="inline-recorder">
-                                  <strong>{voiceMode.shortcut || '未设置'}</strong>
-                                  <button
-                                    type="button"
-                                    className={recording ? 'is-recording' : ''}
-                                    onClick={() => setRecordingId(`voice:${modeId}`)}
-                                  >
-                                    {recording ? '按键中' : '录制'}
-                                  </button>
-                                </div>
-                              </label>
-                            </div>
-
-                            <div className="field-row">
-                              <label className="field">
-                                <span>图标类型</span>
-                                <select
-                                  value={voiceMode.iconType}
-                                  onChange={(event) => updateVoiceMode(modeId, { iconType: event.target.value })}
-                                >
-                                  <option value="lucide">内置图标</option>
-                                  <option value="image">自定义图片</option>
-                                </select>
-                              </label>
-                              {voiceMode.iconType === 'lucide' ? (
-                                <label className="field">
-                                  <span>Lucide 图标名</span>
-                                  <input
-                                    value={voiceMode.icon}
-                                    onChange={(event) => updateVoiceMode(modeId, { icon: event.target.value })}
-                                  />
-                                </label>
-                              ) : (
-                                <div className="field image-field">
-                                  <span>图片</span>
-                                  <button type="button" onClick={() => chooseVoiceModeImage(modeId)}>
-                                    <Icons.ImagePlus size={16} />
-                                    选择图片
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>窗口</h2>
-                  <div className="field-row">
-                    <label className="field">
-                      <span>角落</span>
-                      <select value={draft.window.corner} onChange={(event) => setWindowPatch({ corner: event.target.value })}>
-                        <option value="top-right">右上</option>
-                        <option value="top-left">左上</option>
-                        <option value="bottom-right">右下</option>
-                        <option value="bottom-left">左下</option>
-                      </select>
-                    </label>
-                    <label className="field">
-                      <span>按钮大小 {draft.window.buttonSize}px</span>
-                      <input
-                        type="range"
-                        min="48"
-                        max="112"
-                        value={draft.window.buttonSize}
-                        onChange={(event) => setWindowPatch({ buttonSize: Number(event.target.value) })}
-                      />
-                    </label>
-                  </div>
-
-                  <div className="field-row">
-                    <label className="field">
-                      <span>透明度 {Math.round(draft.window.opacity * 100)}%</span>
-                      <input
-                        type="range"
-                        min="25"
-                        max="100"
-                        value={Math.round(draft.window.opacity * 100)}
-                        onChange={(event) => setWindowPatch({ opacity: Number(event.target.value) / 100 })}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>间距 {draft.window.gap}px</span>
-                      <input
-                        type="range"
-                        min="4"
-                        max="24"
-                        value={draft.window.gap}
-                        onChange={(event) => setWindowPatch({ gap: Number(event.target.value) })}
-                      />
-                    </label>
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>系统</h2>
-                  <label className={`switch-field ${startup.supported ? '' : 'is-disabled'}`}>
-                    <span>
-                      <strong>开机自启动</strong>
-                      <small>{startup.supported ? '跟随 Windows 登录启动' : '打包版中可用'}</small>
-                    </span>
-                    <input
-                      type="checkbox"
-                      checked={startup.enabled}
-                      disabled={!startup.supported}
-                      onChange={toggleStartup}
-                    />
-                  </label>
-                </div>
-              </>
-            ) : null}
+            {renderActiveSection()}
           </section>
         </div>
-
-        <footer className="settings-footer">
-          <button type="button" className="ghost-button" onClick={() => setDraft(config)}>
-            还原
-          </button>
-          <button type="button" className="primary-button" onClick={save}>
-            <Icons.Save size={17} />
-            保存并应用
-          </button>
-        </footer>
+        {renderIconPicker()}
       </section>
     </main>
   );
@@ -1043,8 +1461,16 @@ function ButtonIcon({ button, size }) {
     return <img className="custom-button-image" src={button.image} alt="" draggable="false" />;
   }
 
-  const Icon = Icons[button.icon] || Icons.Circle;
+  return <LucideIcon name={button.icon} size={size} />;
+}
+
+function LucideIcon({ name, size }) {
+  const Icon = Icons[name] || Icons.Circle;
   return <Icon size={size} strokeWidth={2.35} />;
+}
+
+function iconLabel(iconName) {
+  return ICON_PICKER_ITEMS.find((item) => item.icon === iconName)?.label || iconName || '圆形';
 }
 
 function getVoiceModes(config) {
@@ -1089,6 +1515,49 @@ function getPunctuationItems(config) {
       afterShortcut: item.afterShortcut || ''
     }))
     .filter((item) => item.text);
+}
+
+function getEditablePunctuationItems(config) {
+  const items = Array.isArray(config.punctuationItems) && config.punctuationItems.length
+    ? config.punctuationItems
+    : defaultPunctuationItems;
+
+  return items.map((item, index) => ({
+    id: item.id || `punctuation-${index}`,
+    label: item.label || `标点 ${index + 1}`,
+    text: item.text || '',
+    afterShortcut: item.afterShortcut || ''
+  }));
+}
+
+function getEditableDisplayPresets(config) {
+  const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
+    ? config.displayPresets
+    : defaultDisplayPresets;
+
+  return presets.map((preset, index) => {
+    const fallback = defaultDisplayPresets[index] || defaultDisplayPresets[0];
+    return {
+      id: preset.id || `preset-${index + 1}`,
+      label: preset.label || `设置${index + 1}`,
+      width: Number.isFinite(Number(preset.width)) ? Number(preset.width) : fallback.width,
+      height: Number.isFinite(Number(preset.height)) ? Number(preset.height) : fallback.height,
+      scale: Number.isFinite(Number(preset.scale)) ? Number(preset.scale) : fallback.scale,
+      orientation: ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
+        ? preset.orientation
+        : fallback.orientation
+    };
+  });
+}
+
+function moveById(items, id, direction) {
+  const nextItems = [...items];
+  const index = nextItems.findIndex((item) => item.id === id);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= nextItems.length) return items;
+  const [item] = nextItems.splice(index, 1);
+  nextItems.splice(nextIndex, 0, item);
+  return nextItems;
 }
 
 function shortcutLabelForButton(button, config) {
