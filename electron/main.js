@@ -511,12 +511,39 @@ function showDisplayPresetMenu() {
     ? config.displayPresets
     : DEFAULT_DISPLAY_PRESETS;
 
-  const menu = Menu.buildFromTemplate(presets.map((preset, index) => ({
-    label: displayPresetMenuLabel(preset, index),
-    click: () => applyDisplayPresetFromTray(preset)
-  })));
+  const menu = Menu.buildFromTemplate([
+    {
+      label: `悬浮窗回到${windowCornerLabel(config.window.corner)}`,
+      click: () => resetFloatingWindowToDefaultPosition()
+    },
+    { type: 'separator' },
+    ...presets.map((preset, index) => ({
+      label: displayPresetMenuLabel(preset, index),
+      click: () => applyDisplayPresetFromTray(preset)
+    }))
+  ]);
 
   tray.popUpContextMenu(menu);
+}
+
+function windowCornerLabel(corner) {
+  return {
+    'top-left': '左上角',
+    'top-right': '右上角',
+    'bottom-left': '左下角',
+    'bottom-right': '右下角'
+  }[corner] || '默认位置';
+}
+
+function resetFloatingWindowToDefaultPosition() {
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    createFloatingWindow();
+    return;
+  }
+
+  resizeFloatingWindow();
+  floatingWindow.showInactive();
+  floatingWindow.setAlwaysOnTop(true, 'screen-saver');
 }
 
 function displayPresetMenuLabel(preset, index) {
