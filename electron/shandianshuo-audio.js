@@ -247,6 +247,7 @@ async function stopProcesses(processes) {
 function startShandianshuo(executablePath) {
   try {
     const child = spawn(executablePath, ['--autostart'], {
+      cwd: path.dirname(executablePath),
       detached: true,
       windowsHide: true,
       stdio: 'ignore'
