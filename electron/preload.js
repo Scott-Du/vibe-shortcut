@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('vibeShortcut', {
   setSideActionsOpen: (open) => ipcRenderer.invoke('floating:setSideActionsOpen', open),
   getStartup: () => ipcRenderer.invoke('startup:get'),
   setStartup: (enabled) => ipcRenderer.invoke('startup:set', enabled),
+  listShandianshuoAudioDevices: () => ipcRenderer.invoke('shandianshuo:listAudioDevices'),
+  getShandianshuoStatus: () => ipcRenderer.invoke('shandianshuo:getStatus'),
   openSettings: () => ipcRenderer.invoke('settings:open'),
   closeSettings: () => ipcRenderer.invoke('settings:close'),
   chooseImage: () => ipcRenderer.invoke('image:choose'),
@@ -24,5 +26,10 @@ contextBridge.exposeInMainWorld('vibeShortcut', {
     const listener = (_event, startup) => callback(startup);
     ipcRenderer.on('startup:changed', listener);
     return () => ipcRenderer.removeListener('startup:changed', listener);
+  },
+  onShandianshuoStatusChanged: (callback) => {
+    const listener = (_event, status) => callback(status);
+    ipcRenderer.on('shandianshuo:statusChanged', listener);
+    return () => ipcRenderer.removeListener('shandianshuo:statusChanged', listener);
   }
 });

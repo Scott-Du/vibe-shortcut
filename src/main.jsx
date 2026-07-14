@@ -21,9 +21,21 @@ const defaultPunctuationItems = [
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
 ];
 const defaultDisplayPresets = [
-  { id: 'preset-1', label: '设置一', width: 0, height: 0, scale: 175, orientation: 'portrait' },
-  { id: 'preset-2', label: '设置二', width: 0, height: 0, scale: 100, orientation: 'landscape' }
+  { id: 'preset-1', label: '设置一', width: 2000, height: 1200, scale: 200, orientation: 'portrait', target: 'gameviewer-virtual' },
+  { id: 'preset-2', label: '设置二', width: 2000, height: 1200, scale: 200, orientation: 'landscape', target: 'gameviewer-virtual' }
 ];
+const defaultVirtualDisplay = {
+  adapterName: 'GameViewer Virtual Display Adapter',
+  autoRestore: true,
+  lastOrientation: 'portrait',
+  lastPresetId: 'preset-1'
+};
+const defaultRemoteAutomation = {
+  microphoneEnabled: true,
+  localAudioDevice: 'system',
+  remoteAudioDevice: '麦克风阵列 (网易虚拟音频设备)',
+  resetFloatingWindow: true
+};
 const SETTINGS_SECTIONS = [
   { id: 'buttons', label: '按钮' },
   { id: 'voice', label: '语音' },
@@ -94,7 +106,7 @@ const defaultVoiceModes = {
 };
 
 const previewConfig = {
-  schemaVersion: 5,
+  schemaVersion: 7,
   buttons: [
     { id: 'punctuation', label: '标点', iconType: 'lucide', icon: 'Braces', image: '', shortcut: '' },
     { id: 'voice', label: '语音', iconType: 'lucide', icon: 'Mic', image: '', shortcut: 'Ctrl+I' },
@@ -103,6 +115,8 @@ const previewConfig = {
   ],
   punctuationItems: defaultPunctuationItems,
   displayPresets: defaultDisplayPresets,
+  virtualDisplay: defaultVirtualDisplay,
+  remoteAutomation: defaultRemoteAutomation,
   voiceModes: defaultVoiceModes,
   window: { corner: 'bottom-right', buttonSize: 64, gap: 10, opacity: 0.78 }
 };
@@ -140,6 +154,22 @@ const api = window.vibeShortcut || {
   setSideActionsOpen: async () => ({ ok: true }),
   getStartup: async () => ({ enabled: false, supported: false }),
   setStartup: async () => ({ enabled: false, supported: false }),
+  listShandianshuoAudioDevices: async () => ({
+    ok: true,
+    devices: [
+      { id: 'system', label: '自动选择', active: true, system: true },
+      { id: defaultRemoteAutomation.remoteAudioDevice, label: defaultRemoteAutomation.remoteAudioDevice, active: true }
+    ]
+  }),
+  getShandianshuoStatus: async () => ({
+    configExists: true,
+    appRunning: true,
+    waitingForRecording: false,
+    waitingForDevice: false,
+    switching: false,
+    currentDevice: defaultRemoteAutomation.localAudioDevice,
+    lastError: ''
+  }),
   openSettings: () => {
     window.location.href = `${window.location.origin}${window.location.pathname}?mode=settings`;
   },
@@ -148,7 +178,8 @@ const api = window.vibeShortcut || {
   },
   chooseImage: async () => null,
   onConfigChanged: () => () => {},
-  onStartupChanged: () => () => {}
+  onStartupChanged: () => () => {},
+  onShandianshuoStatusChanged: () => () => {}
 };
 
 const mode = new URLSearchParams(window.location.search).get('mode') || 'floating';
@@ -610,6 +641,8 @@ function SettingsApp() {
   const [iconPicker, setIconPicker] = useState(null);
   const [iconSearch, setIconSearch] = useState('');
   const [startup, setStartup] = useState({ enabled: false, supported: false });
+  const [audioDevices, setAudioDevices] = useState([]);
+  const [shandianshuoStatus, setShandianshuoStatus] = useState(null);
   const recorderRef = useRef(null);
   const modifierRecordTimerRef = useRef(null);
   const draftReadyRef = useRef(false);
@@ -627,6 +660,25 @@ function SettingsApp() {
       if (mounted) setStartup(nextStartup);
     });
     const unsubscribe = api.onStartupChanged((nextStartup) => setStartup(nextStartup));
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    api.listShandianshuoAudioDevices().then((result) => {
+      if (mounted) setAudioDevices(Array.isArray(result?.devices) ? result.devices : []);
+    }).catch((error) => {
+      console.error('Failed to list Shandianshuo audio devices', error);
+    });
+    api.getShandianshuoStatus().then((status) => {
+      if (mounted) setShandianshuoStatus(status);
+    }).catch((error) => {
+      console.error('Failed to read Shandianshuo status', error);
+    });
+    const unsubscribe = api.onShandianshuoStatusChanged((status) => setShandianshuoStatus(status));
     return () => {
       mounted = false;
       unsubscribe();
@@ -692,6 +744,10 @@ function SettingsApp() {
   const voiceModes = getVoiceModes(draft);
   const punctuationItems = getEditablePunctuationItems(draft);
   const displayPresets = getEditableDisplayPresets(draft);
+  const virtualDisplay = getVirtualDisplay(draft);
+  const remoteAutomation = getRemoteAutomation(draft);
+  const audioDeviceOptions = getAudioDeviceOptions(audioDevices, remoteAutomation);
+  const shandianshuoStatusText = formatShandianshuoStatus(shandianshuoStatus);
 
   function commitDraft(updater, options) {
     setDraft((current) => {
@@ -843,7 +899,7 @@ function SettingsApp() {
       ...current,
       displayPresets: [
         ...getEditableDisplayPresets(current),
-        { id, label: `设置${index}`, width: 0, height: 0, scale: 100, orientation: 'landscape' }
+        { id, label: `设置${index}`, width: 2000, height: 1200, scale: 200, orientation: 'landscape', target: 'gameviewer-virtual' }
       ]
     }));
   }
@@ -855,6 +911,26 @@ function SettingsApp() {
         preset.id === id ? { ...preset, ...patch } : preset
       ))
     }));
+  }
+
+  function setVirtualDisplayPatch(patch) {
+    commitDraft((current) => ({
+      ...current,
+      virtualDisplay: {
+        ...getVirtualDisplay(current),
+        ...patch
+      }
+    }), { preserveFloatingBounds: true });
+  }
+
+  function setRemoteAutomationPatch(patch) {
+    commitDraft((current) => ({
+      ...current,
+      remoteAutomation: {
+        ...getRemoteAutomation(current),
+        ...patch
+      }
+    }), { preserveFloatingBounds: true });
   }
 
   function removeDisplayPreset(id) {
@@ -1274,11 +1350,97 @@ function SettingsApp() {
         <div className="section-heading">
           <div>
             <h2>屏幕</h2>
-            <p>托盘左键菜单预设</p>
+            <p>UU 虚拟屏预设</p>
           </div>
           <button className="small-icon-button" type="button" onClick={addDisplayPreset} title="新增屏幕预设">
             <Icons.Plus size={17} />
           </button>
+        </div>
+
+        <div className="form-section virtual-display-section">
+          <div className="virtual-display-target">
+            <span className="virtual-display-icon"><Icons.Monitor size={18} /></span>
+            <span>
+              <strong>UU 虚拟屏</strong>
+              <small>仅操作 GameViewer Virtual Display Adapter</small>
+              <small>自动兼容 2000×1200 / 1920×1200</small>
+            </span>
+          </div>
+          <label className="switch-field">
+            <span>
+              <strong>连接后自动恢复</strong>
+              <small>恢复上次选择的方向，不修改物理屏</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={virtualDisplay.autoRestore}
+              onChange={(event) => setVirtualDisplayPatch({ autoRestore: event.target.checked })}
+            />
+          </label>
+        </div>
+
+        <div className="form-section remote-automation-section">
+          <div className="virtual-display-target">
+            <span className="virtual-display-icon"><Icons.Mic size={18} /></span>
+            <span>
+              <strong>闪电说麦克风</strong>
+              <small>{shandianshuoStatusText}</small>
+            </span>
+          </div>
+          <label className="switch-field">
+            <span>
+              <strong>自动切换麦克风</strong>
+              <small>连接 UU 使用虚拟麦克风，断开后切回本地设备</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={remoteAutomation.microphoneEnabled}
+              onChange={(event) => setRemoteAutomationPatch({ microphoneEnabled: event.target.checked })}
+            />
+          </label>
+
+          <div className={`remote-audio-fields ${remoteAutomation.microphoneEnabled ? '' : 'is-disabled'}`}>
+            <label className="field">
+              <span>本地麦克风</span>
+              <select
+                value={remoteAutomation.localAudioDevice}
+                disabled={!remoteAutomation.microphoneEnabled}
+                onChange={(event) => setRemoteAutomationPatch({ localAudioDevice: event.target.value })}
+              >
+                {audioDeviceOptions.map((device) => (
+                  <option key={`local-${device.id}`} value={device.id}>
+                    {device.label}{!device.active && !device.system ? '（当前不可用）' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>远程麦克风</span>
+              <select
+                value={remoteAutomation.remoteAudioDevice}
+                disabled={!remoteAutomation.microphoneEnabled}
+                onChange={(event) => setRemoteAutomationPatch({ remoteAudioDevice: event.target.value })}
+              >
+                {audioDeviceOptions.map((device) => (
+                  <option key={`remote-${device.id}`} value={device.id}>
+                    {device.label}{!device.active && !device.system ? '（当前不可用）' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <label className="switch-field remote-reset-switch">
+            <span>
+              <strong>恢复悬浮窗默认位置</strong>
+              <small>UU 连接或断开后回到外观中设置的角落</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={remoteAutomation.resetFloatingWindow}
+              onChange={(event) => setRemoteAutomationPatch({ resetFloatingWindow: event.target.checked })}
+            />
+          </label>
         </div>
 
         <div className="display-preset-list">
@@ -1324,19 +1486,20 @@ function SettingsApp() {
               <div className="field-row three-columns">
                 <label className="field">
                   <span>缩放</span>
-                  <input
-                    type="number"
-                    min="100"
-                    max="350"
+                  <select
                     value={preset.scale}
                     onChange={(event) => updateDisplayPreset(preset.id, { scale: Number(event.target.value) })}
-                  />
+                  >
+                    {[100, 125, 150, 175, 200, 225, 250, 300, 350].map((scale) => (
+                      <option key={scale} value={scale}>{scale}%</option>
+                    ))}
+                  </select>
                 </label>
                 <label className="field">
                   <span>宽度</span>
                   <input
                     type="number"
-                    min="0"
+                    min="320"
                     value={preset.width}
                     onChange={(event) => updateDisplayPreset(preset.id, { width: Number(event.target.value) })}
                   />
@@ -1345,7 +1508,7 @@ function SettingsApp() {
                   <span>高度</span>
                   <input
                     type="number"
-                    min="0"
+                    min="320"
                     value={preset.height}
                     onChange={(event) => updateDisplayPreset(preset.id, { height: Number(event.target.value) })}
                   />
@@ -1546,9 +1709,60 @@ function getEditableDisplayPresets(config) {
       scale: Number.isFinite(Number(preset.scale)) ? Number(preset.scale) : fallback.scale,
       orientation: ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
         ? preset.orientation
-        : fallback.orientation
+        : fallback.orientation,
+      target: 'gameviewer-virtual'
     };
   });
+}
+
+function getVirtualDisplay(config) {
+  const source = config.virtualDisplay && typeof config.virtualDisplay === 'object'
+    ? config.virtualDisplay
+    : defaultVirtualDisplay;
+  return {
+    adapterName: 'GameViewer Virtual Display Adapter',
+    autoRestore: source.autoRestore !== false,
+    lastOrientation: source.lastOrientation || defaultVirtualDisplay.lastOrientation,
+    lastPresetId: source.lastPresetId || defaultVirtualDisplay.lastPresetId
+  };
+}
+
+function getRemoteAutomation(config) {
+  const source = config.remoteAutomation && typeof config.remoteAutomation === 'object'
+    ? config.remoteAutomation
+    : defaultRemoteAutomation;
+  return {
+    microphoneEnabled: source.microphoneEnabled !== false,
+    localAudioDevice: source.localAudioDevice || defaultRemoteAutomation.localAudioDevice,
+    remoteAudioDevice: source.remoteAudioDevice || defaultRemoteAutomation.remoteAudioDevice,
+    resetFloatingWindow: source.resetFloatingWindow !== false
+  };
+}
+
+function getAudioDeviceOptions(devices, remoteAutomation) {
+  const options = Array.isArray(devices) ? [...devices] : [];
+  const knownIds = new Set(options.map((device) => device.id));
+  if (!knownIds.has('system')) {
+    options.unshift({ id: 'system', label: '自动选择', active: true, system: true });
+    knownIds.add('system');
+  }
+  for (const deviceId of [remoteAutomation.localAudioDevice, remoteAutomation.remoteAudioDevice]) {
+    if (!knownIds.has(deviceId)) {
+      options.push({ id: deviceId, label: deviceId, active: false, system: false });
+      knownIds.add(deviceId);
+    }
+  }
+  return options;
+}
+
+function formatShandianshuoStatus(status) {
+  if (!status) return '正在读取闪电说状态';
+  if (status.waitingForRecording) return '正在录音，结束后自动切换';
+  if (status.waitingForDevice) return '正在等待目标麦克风就绪';
+  if (status.switching) return '正在切换麦克风';
+  if (!status.configExists) return '未找到闪电说配置';
+  if (status.lastError) return status.lastError;
+  return status.appRunning ? '闪电说正在运行' : '闪电说未运行，配置将在下次启动时生效';
 }
 
 function moveById(items, id, direction) {

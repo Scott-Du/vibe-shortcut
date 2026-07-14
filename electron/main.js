@@ -2,6 +2,17 @@ const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage,
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+  GAMEVIEWER_ADAPTER_NAME,
+  applyVirtualDisplayProfile,
+  getVirtualDisplayStatus
+} = require('./virtual-display');
+const {
+  DEFAULT_REMOTE_AUDIO_DEVICE,
+  SYSTEM_AUDIO_DEVICE,
+  ShandianshuoAudioController,
+  listCaptureDevices
+} = require('./shandianshuo-audio');
 
 const DEV_URL = 'http://127.0.0.1:5173';
 const DEFAULT_PUNCTUATION_ITEMS = [
@@ -11,12 +22,27 @@ const DEFAULT_PUNCTUATION_ITEMS = [
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
 ];
 const DEFAULT_DISPLAY_PRESETS = [
-  { id: 'preset-1', label: '设置一', width: 0, height: 0, scale: 175, orientation: 'portrait' },
-  { id: 'preset-2', label: '设置二', width: 0, height: 0, scale: 100, orientation: 'landscape' }
+  { id: 'preset-1', label: '设置一', width: 2000, height: 1200, scale: 200, orientation: 'portrait', target: 'gameviewer-virtual' },
+  { id: 'preset-2', label: '设置二', width: 2000, height: 1200, scale: 200, orientation: 'landscape', target: 'gameviewer-virtual' }
 ];
+const VIRTUAL_DISPLAY_COMPATIBILITY_RESOLUTIONS = [
+  { width: 1920, height: 1200, mode: 'phone' }
+];
+const DEFAULT_VIRTUAL_DISPLAY = {
+  adapterName: GAMEVIEWER_ADAPTER_NAME,
+  autoRestore: true,
+  lastOrientation: 'portrait',
+  lastPresetId: 'preset-1'
+};
+const DEFAULT_REMOTE_AUTOMATION = {
+  microphoneEnabled: true,
+  localAudioDevice: SYSTEM_AUDIO_DEVICE,
+  remoteAudioDevice: DEFAULT_REMOTE_AUDIO_DEVICE,
+  resetFloatingWindow: true
+};
 
 const DEFAULT_CONFIG = {
-  schemaVersion: 5,
+  schemaVersion: 7,
   buttons: [
     {
       id: 'punctuation',
@@ -53,6 +79,8 @@ const DEFAULT_CONFIG = {
   ],
   punctuationItems: DEFAULT_PUNCTUATION_ITEMS,
   displayPresets: DEFAULT_DISPLAY_PRESETS,
+  virtualDisplay: DEFAULT_VIRTUAL_DISPLAY,
+  remoteAutomation: DEFAULT_REMOTE_AUTOMATION,
   voiceModes: {
     activeId: 'lightning',
     options: {
@@ -91,6 +119,17 @@ let sideActionsOpen = false;
 let inputSenderProcess;
 let inputSenderBuffer = '';
 let inputSenderRequestId = 0;
+let virtualDisplayRestoreTimer;
+let virtualDisplayVerifyTimer;
+let virtualDisplayRestoreInProgress = false;
+let virtualDisplaySuppressUntil = 0;
+let virtualDisplaySessionResolution;
+let remoteSessionTimer;
+let remoteSessionCheckInProgress = false;
+let remoteSessionCheckQueued = false;
+let remoteSessionForceSync = false;
+let virtualDisplayConnected;
+let shandianshuoAudioController;
 const inputSenderPending = new Map();
 
 function configPath() {
@@ -100,7 +139,6 @@ function configPath() {
 function mergeConfig(value) {
   const rawValue = value && typeof value === 'object' ? value : {};
   const rawSchemaVersion = Number(rawValue.schemaVersion) || 1;
-  const isLegacyConfig = rawSchemaVersion < DEFAULT_CONFIG.schemaVersion;
   const legacyVoiceButton = Array.isArray(rawValue.buttons)
     ? rawValue.buttons.find((button) => button && button.id === 'voice')
     : null;
@@ -129,7 +167,9 @@ function mergeConfig(value) {
 
   next.buttons = ensureRequiredButtons(next.buttons);
   next.punctuationItems = mergePunctuationItems(rawValue.punctuationItems);
-  next.displayPresets = mergeDisplayPresets(rawValue.displayPresets);
+  next.displayPresets = mergeDisplayPresets(rawValue.displayPresets, rawSchemaVersion);
+  next.virtualDisplay = mergeVirtualDisplay(rawValue.virtualDisplay, next.displayPresets);
+  next.remoteAutomation = mergeRemoteAutomation(rawValue.remoteAutomation);
   next.voiceModes = mergeVoiceModes(rawValue.voiceModes, legacyVoiceButton, rawSchemaVersion);
   next.window.buttonSize = clamp(Number(next.window.buttonSize) || 64, 48, 112);
   next.window.gap = clamp(Number(next.window.gap) || 10, 4, 24);
@@ -165,28 +205,72 @@ function mergePunctuationItems(value) {
     }));
 }
 
-function mergeDisplayPresets(value) {
+function mergeDisplayPresets(value, schemaVersion = DEFAULT_CONFIG.schemaVersion) {
   const source = Array.isArray(value) && value.length ? value : DEFAULT_DISPLAY_PRESETS;
   const presets = source
-    .map((preset, index) => normalizeDisplayPreset(preset, index))
+    .map((preset, index) => normalizeDisplayPreset(preset, index, schemaVersion))
     .filter(Boolean);
   return presets.length ? presets : DEFAULT_DISPLAY_PRESETS.map((preset, index) => normalizeDisplayPreset(preset, index));
 }
 
-function normalizeDisplayPreset(value, index = 0) {
+function normalizeDisplayPreset(value, index = 0, schemaVersion = DEFAULT_CONFIG.schemaVersion) {
   const preset = value && typeof value === 'object' ? value : {};
   const fallback = DEFAULT_DISPLAY_PRESETS[index] || DEFAULT_DISPLAY_PRESETS[0];
-  const orientation = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
-    ? preset.orientation
-    : fallback.orientation;
+  const id = preset.id ? String(preset.id) : `preset-${index + 1}`;
+  const migrateBuiltInPreset = schemaVersion < 6 && ['preset-1', 'preset-2'].includes(id);
+  const orientation = migrateBuiltInPreset
+    ? fallback.orientation
+    : (['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
+        ? preset.orientation
+        : fallback.orientation);
 
   return {
-    id: preset.id ? String(preset.id) : `preset-${index + 1}`,
+    id,
     label: preset.label ? String(preset.label) : `设置${index + 1}`,
-    width: clamp(Math.round(Number(preset.width) || 0), 0, 10000),
-    height: clamp(Math.round(Number(preset.height) || 0), 0, 10000),
-    scale: clamp(Math.round(Number(preset.scale) || fallback.scale), 100, 350),
-    orientation
+    width: migrateBuiltInPreset
+      ? fallback.width
+      : clamp(Math.round(Number(preset.width) || fallback.width), 320, 10000),
+    height: migrateBuiltInPreset
+      ? fallback.height
+      : clamp(Math.round(Number(preset.height) || fallback.height), 320, 10000),
+    scale: migrateBuiltInPreset
+      ? 200
+      : clamp(Math.round(Number(preset.scale) || fallback.scale), 100, 350),
+    orientation,
+    target: 'gameviewer-virtual'
+  };
+}
+
+function mergeVirtualDisplay(value, displayPresets) {
+  const source = value && typeof value === 'object' ? value : {};
+  const orientations = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'];
+  const lastOrientation = orientations.includes(source.lastOrientation)
+    ? source.lastOrientation
+    : DEFAULT_VIRTUAL_DISPLAY.lastOrientation;
+  const requestedPresetId = source.lastPresetId ? String(source.lastPresetId) : '';
+  const matchingPreset = displayPresets.find((preset) => preset.id === requestedPresetId)
+    || displayPresets.find((preset) => preset.orientation === lastOrientation)
+    || displayPresets[0];
+
+  return {
+    adapterName: GAMEVIEWER_ADAPTER_NAME,
+    autoRestore: source.autoRestore !== false,
+    lastOrientation: matchingPreset?.orientation || lastOrientation,
+    lastPresetId: matchingPreset?.id || DEFAULT_VIRTUAL_DISPLAY.lastPresetId
+  };
+}
+
+function mergeRemoteAutomation(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    microphoneEnabled: source.microphoneEnabled !== false,
+    localAudioDevice: typeof source.localAudioDevice === 'string' && source.localAudioDevice.trim()
+      ? source.localAudioDevice.trim()
+      : DEFAULT_REMOTE_AUTOMATION.localAudioDevice,
+    remoteAudioDevice: typeof source.remoteAudioDevice === 'string' && source.remoteAudioDevice.trim()
+      ? source.remoteAudioDevice.trim()
+      : DEFAULT_REMOTE_AUTOMATION.remoteAudioDevice,
+    resetFloatingWindow: source.resetFloatingWindow !== false
   };
 }
 
@@ -245,8 +329,10 @@ function loadConfig() {
 
 function saveConfig(nextConfig, options = {}) {
   const previousLayoutSignature = config ? floatingLayoutSignature(config) : null;
+  const previousRemoteSignature = config ? remoteAutomationSignature(config) : null;
   config = mergeConfig(nextConfig);
   const nextLayoutSignature = floatingLayoutSignature(config);
+  const nextRemoteSignature = remoteAutomationSignature(config);
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(config, null, 2), 'utf8');
   if (!options.preserveFloatingBounds && previousLayoutSignature !== nextLayoutSignature) {
@@ -255,6 +341,18 @@ function saveConfig(nextConfig, options = {}) {
     updateFloatingWindowShape();
   }
   broadcastConfig();
+  if (config.virtualDisplay.autoRestore) {
+    scheduleVirtualDisplayRestore();
+  } else {
+    clearTimeout(virtualDisplayRestoreTimer);
+    clearTimeout(virtualDisplayVerifyTimer);
+  }
+  if (previousRemoteSignature !== nextRemoteSignature) {
+    if (!config.remoteAutomation.microphoneEnabled) {
+      shandianshuoAudioController?.cancelPending();
+    }
+    scheduleRemoteSessionCheck(250, true);
+  }
   return config;
 }
 
@@ -263,6 +361,10 @@ function floatingLayoutSignature(targetConfig) {
     window: targetConfig.window,
     buttonCount: Array.isArray(targetConfig.buttons) ? targetConfig.buttons.length : 0
   });
+}
+
+function remoteAutomationSignature(targetConfig) {
+  return JSON.stringify(targetConfig.remoteAutomation || DEFAULT_REMOTE_AUTOMATION);
 }
 
 function clamp(value, min, max) {
@@ -519,6 +621,8 @@ function showDisplayPresetMenu() {
     { type: 'separator' },
     ...presets.map((preset, index) => ({
       label: displayPresetMenuLabel(preset, index),
+      type: 'checkbox',
+      checked: preset.id === config.virtualDisplay.lastPresetId,
       click: () => applyDisplayPresetFromTray(preset)
     }))
   ]);
@@ -554,7 +658,7 @@ function displayPresetMenuLabel(preset, index) {
     'landscape-flipped': '横向翻转',
     'portrait-flipped': '纵向翻转'
   }[normalized.orientation] || normalized.orientation;
-  return `${normalized.label} · ${orientationText} · ${normalized.scale}%`;
+  return `${normalized.label} · ${orientationText} · ${normalized.width}×${normalized.height} · ${normalized.scale}%`;
 }
 
 function broadcastConfig() {
@@ -1059,68 +1163,147 @@ async function sendShortcutSequence(shortcuts) {
   return { ok: true };
 }
 
-function runPowerShell(command) {
-  return new Promise((resolve) => {
-    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
-      windowsHide: true
-    });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('error', (error) => {
-      resolve({ ok: false, error: error.message });
-    });
-    child.on('exit', (code) => {
-      resolve(code === 0
-        ? { ok: true, output: stdout.trim() }
-        : { ok: false, error: stderr.trim() || stdout.trim() || `PowerShell exited with code ${code}` });
-    });
-  });
-}
-
 async function applyDisplayPresetFromTray(preset) {
-  const result = await applyDisplayPreset(preset);
-  const failedStep = result.results.find((step) => !step.ok);
+  const normalized = rememberVirtualDisplayPreset(preset);
+  const result = await applyDisplayPreset(normalized);
+  const failedStep = [...result.results].reverse().find((step) => !step.ok);
+  const waitingForConnection = !result.ok && failedStep?.step === 'detect' && !failedStep.connected;
+  const appliedPreset = result.preset || normalized;
+  const appliedDimensions = effectiveDisplayDimensions(appliedPreset);
+  const compatibilityText = result.candidateIndex > 0 ? '（手机兼容模式）' : '';
+
+  if (result.ok && config.virtualDisplay.autoRestore) {
+    clearTimeout(virtualDisplayVerifyTimer);
+    virtualDisplayVerifyTimer = setTimeout(
+      () => verifyVirtualDisplayRestore({
+        requestedPreset: normalized,
+        appliedPreset,
+        candidateIndex: result.candidateIndex,
+        retryCount: 0
+      }),
+      3200
+    );
+  }
 
   if (tray && typeof tray.displayBalloon === 'function') {
     tray.displayBalloon({
-      title: result.ok ? '已应用屏幕预设' : '屏幕预设未完全应用',
-      content: result.ok
-        ? '分辨率和方向已提交；缩放比例可能需要注销或重新登录后完全生效。'
+      title: waitingForConnection ? '已记住虚拟屏方向' : (result.ok ? '已应用 UU 虚拟屏预设' : 'UU 虚拟屏预设未完全应用'),
+      content: waitingForConnection
+        ? 'UU 虚拟屏连接后会自动应用该方向。'
+        : result.ok
+          ? `${appliedDimensions.width} × ${appliedDimensions.height}、${appliedPreset.scale}% ${compatibilityText}已应用到 UU 虚拟屏。`
         : failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。'
     });
-  } else if (!result.ok) {
-    dialog.showErrorBox('屏幕预设未完全应用', failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。');
+  } else if (!result.ok && !waitingForConnection) {
+    dialog.showErrorBox('UU 虚拟屏预设未完全应用', failedStep?.error || '请检查当前虚拟屏是否支持该分辨率或方向。');
   }
 
   return result;
 }
 
-async function applyDisplayPreset(preset) {
+function rememberVirtualDisplayPreset(preset) {
   const normalized = normalizeDisplayPreset(preset);
+  const nextConfig = {
+    ...config,
+    virtualDisplay: {
+      ...config.virtualDisplay,
+      lastOrientation: normalized.orientation,
+      lastPresetId: normalized.id
+    }
+  };
+  saveConfig(nextConfig, { preserveFloatingBounds: true });
+  return config.displayPresets.find((item) => item.id === normalized.id) || normalized;
+}
+
+function compatibleDisplayProfiles(preset) {
+  const normalized = normalizeDisplayPreset(preset);
+  const profiles = [normalized];
+  if (normalized.width === 2000 && normalized.height === 1200) {
+    for (const resolution of VIRTUAL_DISPLAY_COMPATIBILITY_RESOLUTIONS) {
+      profiles.push({
+        ...normalized,
+        width: resolution.width,
+        height: resolution.height,
+        compatibilityMode: resolution.mode
+      });
+    }
+  }
+  return profiles;
+}
+
+function sessionCandidateIndex(profiles) {
+  if (!virtualDisplaySessionResolution) return -1;
+  return profiles.findIndex((profile) => (
+    profile.width === virtualDisplaySessionResolution.width
+    && profile.height === virtualDisplaySessionResolution.height
+  ));
+}
+
+function canTryCompatibleProfile(result) {
+  return Boolean(
+    result.connected
+    && ['display-test', 'display', 'verify'].includes(result.step)
+  );
+}
+
+async function applyDisplayPreset(preset, options = {}) {
+  const profiles = compatibleDisplayProfiles(preset);
+  const requestedIndex = Number.isInteger(options.candidateIndex)
+    ? clamp(options.candidateIndex, 0, profiles.length - 1)
+    : -1;
+  const rememberedIndex = options.preferSession === false ? -1 : sessionCandidateIndex(profiles);
+  const firstIndex = requestedIndex >= 0 ? requestedIndex : (rememberedIndex >= 0 ? rememberedIndex : 0);
+  const candidateIndexes = options.allowFallback === false
+    ? [firstIndex]
+    : [firstIndex, ...profiles.map((_, index) => index).filter((index) => index !== firstIndex)];
   const results = [];
 
-  const displayResult = await applyDisplayMode(normalized);
-  results.push({ step: 'display', ...displayResult });
-  resizeFloatingWindow();
+  for (const candidateIndex of candidateIndexes) {
+    const candidate = profiles[candidateIndex];
+    virtualDisplaySuppressUntil = Date.now() + 3000;
+    const displayResult = await applyVirtualDisplayProfile(candidate, config.virtualDisplay.adapterName);
+    results.push({
+      step: displayResult.step || 'display',
+      ...displayResult,
+      candidateIndex,
+      profile: candidate
+    });
 
-  const scaleResult = await applyDisplayScale(normalized.scale);
-  results.push({ step: 'scale', ...scaleResult, needsSignOut: true });
+    if (displayResult.ok) {
+      virtualDisplaySessionResolution = {
+        width: candidate.width,
+        height: candidate.height,
+        deviceName: displayResult.deviceName || ''
+      };
+      return {
+        ok: true,
+        preset: candidate,
+        candidateIndex,
+        results
+      };
+    }
+
+    if (options.allowFallback === false || !canTryCompatibleProfile(displayResult)) break;
+  }
 
   return {
-    ok: results.every((result) => result.ok),
-    preset: normalized,
+    ok: false,
+    preset: profiles[firstIndex],
+    candidateIndex: firstIndex,
     results
   };
 }
 
-function applyDisplayMode(preset) {
+function getAutoRestorePreset() {
+  const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
+    ? config.displayPresets
+    : DEFAULT_DISPLAY_PRESETS;
+  return presets.find((preset) => preset.id === config.virtualDisplay.lastPresetId)
+    || presets.find((preset) => preset.orientation === config.virtualDisplay.lastOrientation)
+    || presets[0];
+}
+
+function displayStatusMatchesPreset(status, preset) {
   const orientationCodes = {
     landscape: 0,
     portrait: 1,
@@ -1128,62 +1311,244 @@ function applyDisplayMode(preset) {
     'portrait-flipped': 3
   };
   const orientation = orientationCodes[preset.orientation] ?? 1;
-  const width = Number(preset.width) || 0;
-  const height = Number(preset.height) || 0;
-  const typeDefinition = [
-    'using System;',
-    'using System.Runtime.InteropServices;',
-    'public static class DisplaySettings {',
-    '  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]',
-    '  public struct DEVMODE {',
-    '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;',
-    '    public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;',
-    '    public int dmFields;',
-    '    public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;',
-    '    public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;',
-    '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;',
-    '    public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;',
-    '    public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent;',
-    '    public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2;',
-    '    public int dmPanningWidth; public int dmPanningHeight;',
-    '  }',
-    '  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);',
-    '  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettingsEx(string deviceName, ref DEVMODE devMode, IntPtr hwnd, int flags, IntPtr lParam);',
-    '  public static int Apply(int width, int height, int orientation) {',
-    '    DEVMODE mode = new DEVMODE();',
-    '    mode.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));',
-    '    EnumDisplaySettings(null, -1, ref mode);',
-    '    int nextWidth = width > 0 && height > 0 ? width : mode.dmPelsWidth;',
-    '    int nextHeight = width > 0 && height > 0 ? height : mode.dmPelsHeight;',
-    '    if (!(width > 0 && height > 0) && ((mode.dmDisplayOrientation % 2) != (orientation % 2))) { int swap = nextWidth; nextWidth = nextHeight; nextHeight = swap; }',
-    '    mode.dmFields = 0x80 | 0x80000 | 0x100000;',
-    '    mode.dmDisplayOrientation = orientation;',
-    '    mode.dmPelsWidth = nextWidth;',
-    '    mode.dmPelsHeight = nextHeight;',
-    '    return ChangeDisplaySettingsEx(null, ref mode, IntPtr.Zero, 0, IntPtr.Zero);',
-    '  }',
-    '}'
-  ].join(' ');
-  const encodedType = Buffer.from(typeDefinition, 'utf16le').toString('base64');
-  const command = [
-    `$type = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedType}'))`,
-    'Add-Type -TypeDefinition $type',
-    `$result = [DisplaySettings]::Apply(${width}, ${height}, ${orientation})`,
-    'if ($result -ne 0) { throw "ChangeDisplaySettingsEx returned $result" }'
-  ].join('; ');
-
-  return runPowerShell(command);
+  const portrait = orientation % 2 === 1;
+  const expectedWidth = portrait ? preset.height : preset.width;
+  const expectedHeight = portrait ? preset.width : preset.height;
+  return Boolean(
+    status.connected
+    && status.ok
+    && status.width === expectedWidth
+    && status.height === expectedHeight
+    && status.orientation === orientation
+    && status.scale === preset.scale
+  );
 }
 
-function applyDisplayScale(scale) {
-  const dpi = Math.round(96 * clamp(Number(scale) || DEFAULT_DISPLAY_PRESETS[0].scale, 100, 350) / 100);
-  const command = [
-    `Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name Win8DpiScaling -Type DWord -Value 1`,
-    `Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name LogPixels -Type DWord -Value ${dpi}`,
-    'Start-Process -FilePath rundll32.exe -ArgumentList "user32.dll,UpdatePerUserSystemParameters" -WindowStyle Hidden'
-  ].join('; ');
+function effectiveDisplayDimensions(preset) {
+  const portrait = ['portrait', 'portrait-flipped'].includes(preset.orientation);
+  return {
+    width: portrait ? preset.height : preset.width,
+    height: portrait ? preset.width : preset.height
+  };
+}
 
-  return runPowerShell(command);
+function scheduleVirtualDisplayRestore(delay = 1500) {
+  if (!config?.virtualDisplay?.autoRestore) return;
+  if (Date.now() < virtualDisplaySuppressUntil) return;
+  clearTimeout(virtualDisplayRestoreTimer);
+  virtualDisplayRestoreTimer = setTimeout(() => {
+    virtualDisplayRestoreTimer = undefined;
+    runVirtualDisplayRestore();
+  }, delay);
+}
+
+async function runVirtualDisplayRestore(context = {}) {
+  if (virtualDisplayRestoreInProgress || !config?.virtualDisplay?.autoRestore) return;
+  if (Date.now() < virtualDisplaySuppressUntil) return;
+  virtualDisplayRestoreInProgress = true;
+  try {
+    const requestedPreset = context.requestedPreset || getAutoRestorePreset();
+    const profiles = compatibleDisplayProfiles(requestedPreset);
+    const rememberedIndex = sessionCandidateIndex(profiles);
+    const candidateIndex = Number.isInteger(context.candidateIndex)
+      ? clamp(context.candidateIndex, 0, profiles.length - 1)
+      : (rememberedIndex >= 0 ? rememberedIndex : 0);
+    const expectedPreset = profiles[candidateIndex];
+    const status = await getVirtualDisplayStatus(config.virtualDisplay.adapterName);
+    if (!status.connected) {
+      virtualDisplaySessionResolution = undefined;
+      return;
+    }
+    if (displayStatusMatchesPreset(status, expectedPreset)) return;
+
+    const result = await applyDisplayPreset(requestedPreset, {
+      candidateIndex: Number.isInteger(context.candidateIndex) ? candidateIndex : undefined,
+      allowFallback: !Number.isInteger(context.candidateIndex) || candidateIndex < profiles.length - 1
+    });
+    if (!result.ok) {
+      notifyVirtualDisplayFailure(result.results.at(-1)?.error);
+      return;
+    }
+
+    clearTimeout(virtualDisplayVerifyTimer);
+    virtualDisplayVerifyTimer = setTimeout(
+      () => verifyVirtualDisplayRestore({
+        requestedPreset,
+        appliedPreset: result.preset,
+        candidateIndex: result.candidateIndex,
+        retryCount: result.candidateIndex === candidateIndex
+          ? (Number(context.retryCount) || 0)
+          : 0
+      }),
+      3200
+    );
+  } finally {
+    virtualDisplayRestoreInProgress = false;
+  }
+}
+
+async function verifyVirtualDisplayRestore(context) {
+  if (!config?.virtualDisplay?.autoRestore) return;
+  const status = await getVirtualDisplayStatus(config.virtualDisplay.adapterName);
+  if (!status.connected) {
+    virtualDisplaySessionResolution = undefined;
+    return;
+  }
+  if (displayStatusMatchesPreset(status, context.appliedPreset)) return;
+
+  if (context.retryCount < 1) {
+    await runVirtualDisplayRestore({
+      requestedPreset: context.requestedPreset,
+      candidateIndex: context.candidateIndex,
+      retryCount: context.retryCount + 1
+    });
+    return;
+  }
+
+  const profiles = compatibleDisplayProfiles(context.requestedPreset);
+  const nextCandidateIndex = context.candidateIndex + 1;
+  if (nextCandidateIndex < profiles.length) {
+    virtualDisplaySessionResolution = undefined;
+    await runVirtualDisplayRestore({
+      requestedPreset: context.requestedPreset,
+      candidateIndex: nextCandidateIndex,
+      retryCount: 0
+    });
+    return;
+  }
+
+  notifyVirtualDisplayFailure('UU 再次覆盖了所有兼容分辨率；将在下次显示变化时重新尝试。');
+}
+
+function notifyVirtualDisplayFailure(message) {
+  const content = message || '请检查 UU 虚拟屏是否支持该分辨率、方向和缩放比例。';
+  if (tray && typeof tray.displayBalloon === 'function') {
+    tray.displayBalloon({ title: 'UU 虚拟屏自动恢复失败', content });
+  }
+}
+
+function wait(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function scheduleRemoteSessionCheck(delay = 2200, forceSync = false) {
+  if (!config) return;
+  if (forceSync) remoteSessionForceSync = true;
+  clearTimeout(remoteSessionTimer);
+  remoteSessionTimer = setTimeout(() => {
+    remoteSessionTimer = undefined;
+    runRemoteSessionCheck();
+  }, delay);
+}
+
+function virtualDisplayConnectionValue(status) {
+  if (status?.connected) return true;
+  if (status?.step === 'detect') return false;
+  return undefined;
+}
+
+async function runRemoteSessionCheck() {
+  if (remoteSessionCheckInProgress) {
+    remoteSessionCheckQueued = true;
+    return;
+  }
+
+  remoteSessionCheckInProgress = true;
+  const forceSync = remoteSessionForceSync;
+  remoteSessionForceSync = false;
+  try {
+    const firstStatus = await getVirtualDisplayStatus(config.virtualDisplay.adapterName);
+    const nextConnected = virtualDisplayConnectionValue(firstStatus);
+    if (nextConnected === undefined) return;
+
+    const connectionChanged = virtualDisplayConnected === undefined || virtualDisplayConnected !== nextConnected;
+    if (connectionChanged) {
+      await wait(700);
+      const confirmedStatus = await getVirtualDisplayStatus(config.virtualDisplay.adapterName);
+      if (virtualDisplayConnectionValue(confirmedStatus) !== nextConnected) {
+        scheduleRemoteSessionCheck(1200, forceSync);
+        return;
+      }
+    }
+
+    if (!connectionChanged && !forceSync) return;
+    virtualDisplayConnected = nextConnected;
+    await applyRemoteSessionAutomation(nextConnected, { connectionChanged });
+  } finally {
+    remoteSessionCheckInProgress = false;
+    if (remoteSessionCheckQueued) {
+      remoteSessionCheckQueued = false;
+      scheduleRemoteSessionCheck(300);
+    }
+  }
+}
+
+async function applyRemoteSessionAutomation(connected, options = {}) {
+  const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
+  if (automation.microphoneEnabled) {
+    shandianshuoAudioController?.requestDevice(
+      connected ? automation.remoteAudioDevice : automation.localAudioDevice
+    );
+  } else {
+    shandianshuoAudioController?.cancelPending();
+  }
+
+  if (connected && config.virtualDisplay.autoRestore) {
+    clearTimeout(virtualDisplayRestoreTimer);
+    virtualDisplayRestoreTimer = undefined;
+    while (virtualDisplayRestoreInProgress) await wait(150);
+    if (Date.now() < virtualDisplaySuppressUntil) {
+      await wait(virtualDisplaySuppressUntil - Date.now() + 100);
+    }
+    await runVirtualDisplayRestore();
+  }
+
+  if (options.connectionChanged && automation.resetFloatingWindow) {
+    resetFloatingWindowToDefaultPosition();
+  }
+}
+
+function notifyRemoteAutomationFailure(message) {
+  if (tray && typeof tray.displayBalloon === 'function') {
+    tray.displayBalloon({
+      title: '闪电说麦克风切换失败',
+      content: message || '请检查闪电说和录音设备状态。'
+    });
+  }
+}
+
+function broadcastShandianshuoStatus(status) {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('shandianshuo:statusChanged', status);
+  }
+}
+
+async function getShandianshuoAudioDevices() {
+  const result = await listCaptureDevices();
+  const devices = [
+    { id: SYSTEM_AUDIO_DEVICE, label: '自动选择', active: true, system: true },
+    ...result.devices
+  ];
+  const knownIds = new Set(devices.map((device) => device.id));
+  for (const audioDevice of [config.remoteAutomation.localAudioDevice, config.remoteAutomation.remoteAudioDevice]) {
+    if (!knownIds.has(audioDevice)) {
+      devices.push({ id: audioDevice, label: audioDevice, active: false, system: false });
+      knownIds.add(audioDevice);
+    }
+  }
+  return { ok: result.ok, devices, error: result.error || '' };
+}
+
+function registerVirtualDisplayAutomation() {
+  const schedule = () => {
+    scheduleVirtualDisplayRestore();
+    scheduleRemoteSessionCheck();
+  };
+  screen.on('display-added', schedule);
+  screen.on('display-metrics-changed', schedule);
+  screen.on('display-removed', schedule);
+  scheduleVirtualDisplayRestore();
+  scheduleRemoteSessionCheck(300);
 }
 
 function startRepeatShortcut(shortcut) {
@@ -1292,6 +1657,8 @@ function registerIpc() {
     updateTrayMenu();
     return state;
   });
+  ipcMain.handle('shandianshuo:listAudioDevices', () => getShandianshuoAudioDevices());
+  ipcMain.handle('shandianshuo:getStatus', () => shandianshuoAudioController?.getStatus() || null);
   ipcMain.handle('settings:open', () => createSettingsWindow());
   ipcMain.handle('settings:close', () => {
     if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.close();
@@ -1327,10 +1694,16 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     config = loadConfig();
     registerAssetProtocol();
+    shandianshuoAudioController = new ShandianshuoAudioController({
+      appDataPath: app.getPath('appData'),
+      notify: notifyRemoteAutomationFailure,
+      onStatusChanged: broadcastShandianshuoStatus
+    });
     registerIpc();
     createFloatingWindow();
     createTray();
     ensureInputSender();
+    registerVirtualDisplayAutomation();
 
     app.on('activate', () => {
       if (!floatingWindow) createFloatingWindow();
@@ -1338,6 +1711,10 @@ if (!gotSingleInstanceLock) {
   });
 
   app.on('before-quit', () => {
+    clearTimeout(virtualDisplayRestoreTimer);
+    clearTimeout(virtualDisplayVerifyTimer);
+    clearTimeout(remoteSessionTimer);
+    shandianshuoAudioController?.dispose();
     stopInputSender();
   });
 

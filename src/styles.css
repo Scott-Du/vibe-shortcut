@@ -775,6 +775,74 @@ button {
   gap: 13px;
 }
 
+.virtual-display-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.remote-automation-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.remote-audio-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  transition: opacity 120ms ease;
+}
+
+.remote-audio-fields.is-disabled {
+  opacity: 0.56;
+}
+
+.remote-reset-switch {
+  padding-top: 14px;
+  border-top: 1px solid rgba(121, 138, 158, 0.14);
+}
+
+.virtual-display-target {
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(121, 138, 158, 0.14);
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.virtual-display-icon {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(42, 141, 222, 0.24);
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: #155da1;
+  background: rgba(231, 243, 255, 0.7);
+}
+
+.virtual-display-target > span:last-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.virtual-display-target strong {
+  color: #17202d;
+  font-size: 14px;
+}
+
+.virtual-display-target small {
+  overflow: hidden;
+  color: #667486;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .item-config-header {
   min-height: 36px;
   display: flex;
