@@ -19,6 +19,8 @@ public sealed class VirtualDisplayResult
     public string DeviceName { get; set; }
     public int Width { get; set; }
     public int Height { get; set; }
+    public int PositionX { get; set; }
+    public int PositionY { get; set; }
     public int Orientation { get; set; }
     public int Scale { get; set; }
 }
@@ -30,6 +32,7 @@ public static class VibeVirtualDisplay
     private const int ENUM_CURRENT_SETTINGS = -1;
     private const int DISP_CHANGE_SUCCESSFUL = 0;
     private const int CDS_TEST = 0x2;
+    private const int CDS_RESET = 0x40000000;
     private const int DM_DISPLAYORIENTATION = 0x80;
     private const int DM_PELSWIDTH = 0x80000;
     private const int DM_PELSHEIGHT = 0x100000;
@@ -230,6 +233,8 @@ public static class VibeVirtualDisplay
         result.DeviceName = display.DeviceName;
         result.Width = mode.dmPelsWidth;
         result.Height = mode.dmPelsHeight;
+        result.PositionX = mode.dmPositionX;
+        result.PositionY = mode.dmPositionY;
         result.Orientation = mode.dmDisplayOrientation;
 
         string dpiError;
@@ -246,7 +251,7 @@ public static class VibeVirtualDisplay
         return result;
     }
 
-    public static VirtualDisplayResult Apply(string adapterName, int baseWidth, int baseHeight, int orientation, int scale)
+    public static VirtualDisplayResult Apply(string adapterName, int baseWidth, int baseHeight, int orientation, int scale, bool forceMode)
     {
         DISPLAY_DEVICE display;
         if (!TryFindVirtualDisplay(adapterName, out display))
@@ -268,7 +273,7 @@ public static class VibeVirtualDisplay
         }
 
         bool changed = false;
-        if (mode.dmPelsWidth != targetWidth || mode.dmPelsHeight != targetHeight || mode.dmDisplayOrientation != orientation)
+        if (forceMode || mode.dmPelsWidth != targetWidth || mode.dmPelsHeight != targetHeight || mode.dmDisplayOrientation != orientation)
         {
             mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION;
             mode.dmPelsWidth = targetWidth;
@@ -281,7 +286,7 @@ public static class VibeVirtualDisplay
                 return NewResult(false, true, adapterName, "display-test", "UU 虚拟屏不支持所选分辨率或方向，测试返回 " + testResult + "。");
             }
 
-            int applyResult = ChangeDisplaySettingsEx(display.DeviceName, ref mode, IntPtr.Zero, 0, IntPtr.Zero);
+            int applyResult = ChangeDisplaySettingsEx(display.DeviceName, ref mode, IntPtr.Zero, forceMode ? CDS_RESET : 0, IntPtr.Zero);
             if (applyResult != DISP_CHANGE_SUCCESSFUL)
             {
                 return NewResult(false, true, adapterName, "display", "应用 UU 虚拟屏显示模式失败，返回 " + applyResult + "。");
@@ -594,6 +599,8 @@ function normalizeResult(value) {
     deviceName: result.DeviceName || '',
     width: Number(result.Width) || 0,
     height: Number(result.Height) || 0,
+    positionX: Number(result.PositionX) || 0,
+    positionY: Number(result.PositionY) || 0,
     orientation: Number.isFinite(Number(result.Orientation)) ? Number(result.Orientation) : 0,
     scale: Number(result.Scale) || 0
   };
@@ -601,7 +608,9 @@ function normalizeResult(value) {
 
 function invokeDisplayMethod(method, args) {
   const serializedArgs = args.map((value) => (
-    typeof value === 'number' ? String(Math.trunc(value)) : powershellString(value)
+    typeof value === 'number'
+      ? String(Math.trunc(value))
+      : (typeof value === 'boolean' ? `$${value}` : powershellString(value))
   ));
   const command = [
     '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
@@ -670,7 +679,7 @@ function getVirtualDisplayStatus(adapterName = GAMEVIEWER_ADAPTER_NAME) {
   return invokeDisplayMethod('GetStatus', [adapterName]);
 }
 
-function applyVirtualDisplayProfile(profile, adapterName = GAMEVIEWER_ADAPTER_NAME) {
+function applyVirtualDisplayProfile(profile, adapterName = GAMEVIEWER_ADAPTER_NAME, options = {}) {
   const orientationCodes = {
     landscape: 0,
     portrait: 1,
@@ -682,12 +691,27 @@ function applyVirtualDisplayProfile(profile, adapterName = GAMEVIEWER_ADAPTER_NA
     Number(profile.width) || 0,
     Number(profile.height) || 0,
     orientationCodes[profile.orientation] ?? 1,
-    Number(profile.scale) || 0
+    Number(profile.scale) || 0,
+    options.forceMode === true
   ]);
+}
+
+function orderVirtualDisplayProfileIndexes(profileCount, options = {}) {
+  const indexes = Array.from({ length: Math.max(0, Number(profileCount) || 0) }, (_, index) => index);
+  if (!indexes.length) return [];
+
+  const requestedIndex = indexes.includes(options.requestedIndex) ? options.requestedIndex : -1;
+  const rememberedIndex = options.preferSession !== false && indexes.includes(options.rememberedIndex)
+    ? options.rememberedIndex
+    : -1;
+  const firstIndex = requestedIndex >= 0 ? requestedIndex : (rememberedIndex >= 0 ? rememberedIndex : 0);
+  if (options.allowFallback === false) return [firstIndex];
+  return [firstIndex, ...indexes.filter((index) => index !== firstIndex)];
 }
 
 module.exports = {
   GAMEVIEWER_ADAPTER_NAME,
   applyVirtualDisplayProfile,
-  getVirtualDisplayStatus
+  getVirtualDisplayStatus,
+  orderVirtualDisplayProfileIndexes
 };
