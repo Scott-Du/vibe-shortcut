@@ -709,9 +709,40 @@ function orderVirtualDisplayProfileIndexes(profileCount, options = {}) {
   return [firstIndex, ...indexes.filter((index) => index !== firstIndex)];
 }
 
+function createLatestIntentQueue() {
+  let revision = 0;
+  let queue = Promise.resolve();
+
+  return {
+    begin() {
+      revision += 1;
+      return revision;
+    },
+    current() {
+      return revision;
+    },
+    isCurrent(candidate) {
+      return candidate === revision;
+    },
+    enqueue(candidate, task) {
+      const operation = queue
+        .catch(() => undefined)
+        .then(() => {
+          if (candidate !== revision) {
+            return { ok: false, stale: true, results: [] };
+          }
+          return task();
+        });
+      queue = operation.catch(() => undefined);
+      return operation;
+    }
+  };
+}
+
 module.exports = {
   GAMEVIEWER_ADAPTER_NAME,
   applyVirtualDisplayProfile,
+  createLatestIntentQueue,
   getVirtualDisplayStatus,
   orderVirtualDisplayProfileIndexes
 };

@@ -5,9 +5,11 @@ const path = require('path');
 const {
   GAMEVIEWER_ADAPTER_NAME,
   applyVirtualDisplayProfile,
+  createLatestIntentQueue,
   getVirtualDisplayStatus,
   orderVirtualDisplayProfileIndexes
 } = require('./virtual-display');
+const { GameViewerSessionWatcher } = require('./gameviewer-session');
 const {
   DEFAULT_REMOTE_AUDIO_DEVICE,
   SYSTEM_AUDIO_DEVICE,
@@ -128,13 +130,11 @@ let virtualDisplayVerifyTimer;
 let virtualDisplayRestoreInProgress = false;
 let virtualDisplaySuppressUntil = 0;
 let virtualDisplaySessionResolution;
-let remoteSessionTimer;
-let remoteSessionCheckInProgress = false;
-let remoteSessionCheckQueued = false;
-let remoteSessionForceSync = false;
-let remoteSessionEntrySync = false;
-let virtualDisplayConnected;
+const virtualDisplayIntent = createLatestIntentQueue();
 let virtualDisplayNativeOrigin;
+let gameViewerSessionConnected;
+let gameViewerSessionWatcher;
+let gameViewerSessionAutomationTimer;
 let nativeDisplayChangeAt = 0;
 let floatingResetTimer;
 let shandianshuoAudioController;
@@ -338,9 +338,18 @@ function loadConfig() {
 function saveConfig(nextConfig, options = {}) {
   const previousLayoutSignature = config ? floatingLayoutSignature(config) : null;
   const previousRemoteSignature = config ? remoteAutomationSignature(config) : null;
+  const previousDisplaySignature = config ? virtualDisplayConfigSignature(config) : null;
   config = mergeConfig(nextConfig);
   const nextLayoutSignature = floatingLayoutSignature(config);
   const nextRemoteSignature = remoteAutomationSignature(config);
+  const nextDisplaySignature = virtualDisplayConfigSignature(config);
+  if (
+    previousDisplaySignature !== null
+    && previousDisplaySignature !== nextDisplaySignature
+    && !options.preserveVirtualDisplayIntent
+  ) {
+    beginVirtualDisplayIntent();
+  }
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(config, null, 2), 'utf8');
   if (!options.preserveFloatingBounds && previousLayoutSignature !== nextLayoutSignature) {
@@ -349,17 +358,18 @@ function saveConfig(nextConfig, options = {}) {
     updateFloatingWindowShape();
   }
   broadcastConfig();
-  if (config.virtualDisplay.autoRestore) {
+  if (
+    config.virtualDisplay.autoRestore
+    && gameViewerSessionConnected === true
+    && !options.skipVirtualDisplayRestore
+  ) {
     scheduleVirtualDisplayRestore();
   } else {
     clearTimeout(virtualDisplayRestoreTimer);
     clearTimeout(virtualDisplayVerifyTimer);
   }
   if (previousRemoteSignature !== nextRemoteSignature) {
-    if (!config.remoteAutomation.microphoneEnabled) {
-      shandianshuoAudioController?.cancelPending();
-    }
-    scheduleRemoteSessionCheck(250, { forceSync: true });
+    syncRemoteMicrophone(gameViewerSessionConnected);
   }
   return config;
 }
@@ -373,6 +383,13 @@ function floatingLayoutSignature(targetConfig) {
 
 function remoteAutomationSignature(targetConfig) {
   return JSON.stringify(targetConfig.remoteAutomation || DEFAULT_REMOTE_AUTOMATION);
+}
+
+function virtualDisplayConfigSignature(targetConfig) {
+  return JSON.stringify({
+    displayPresets: targetConfig.displayPresets,
+    virtualDisplay: targetConfig.virtualDisplay
+  });
 }
 
 function clamp(value, min, max) {
@@ -413,7 +430,7 @@ function floatingBounds() {
 }
 
 function floatingTargetDisplay() {
-  if (virtualDisplayConnected && virtualDisplayNativeOrigin) {
+  if (gameViewerSessionConnected === true && virtualDisplayNativeOrigin) {
     const matchingDisplay = screen.getAllDisplays().find((display) => (
       display.nativeOrigin?.x === virtualDisplayNativeOrigin.x
       && display.nativeOrigin?.y === virtualDisplayNativeOrigin.y
@@ -489,7 +506,7 @@ function createFloatingWindow() {
     floatingWindow.hookWindowMessage(WM_DISPLAYCHANGE, () => {
       if (Date.now() < virtualDisplaySuppressUntil) return;
       nativeDisplayChangeAt = Date.now();
-      scheduleRemoteSessionCheck(3000, { forceSync: true, entrySync: true });
+      scheduleVirtualDisplayRestoreForActiveSession(3000);
     });
     floatingWindow.hookWindowMessage(WM_DEVICECHANGE, (wParam) => {
       const eventType = Buffer.isBuffer(wParam) && wParam.length >= 4
@@ -501,7 +518,7 @@ function createFloatingWindow() {
         || !followsDisplayChange
         || Date.now() < virtualDisplaySuppressUntil
       ) return;
-      scheduleRemoteSessionCheck(1200, { forceSync: true, entrySync: true });
+      scheduleVirtualDisplayRestoreForActiveSession(1200);
     });
   }
 
@@ -1211,11 +1228,18 @@ async function sendShortcutSequence(shortcuts) {
 }
 
 async function applyDisplayPresetFromTray(preset) {
-  const normalized = rememberVirtualDisplayPreset(preset);
+  const intentRevision = beginVirtualDisplayIntent();
+  const normalized = rememberVirtualDisplayPreset(preset, {
+    preserveVirtualDisplayIntent: true,
+    skipVirtualDisplayRestore: true
+  });
   const result = await applyDisplayPreset(normalized, {
     preferSession: false,
-    forceMode: true
+    forceMode: true,
+    refreshIfMatching: true,
+    intentRevision
   });
+  if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return result;
   const failedStep = [...result.results].reverse().find((step) => !step.ok);
   const waitingForConnection = !result.ok && failedStep?.step === 'detect' && !failedStep.connected;
   const appliedPreset = result.preset || normalized;
@@ -1234,7 +1258,8 @@ async function applyDisplayPresetFromTray(preset) {
         appliedPreset,
         candidateIndex: result.candidateIndex,
         retryCount: 0,
-        forceMode: true
+        forceMode: true,
+        intentRevision
       }),
       3200
     );
@@ -1256,7 +1281,7 @@ async function applyDisplayPresetFromTray(preset) {
   return result;
 }
 
-function rememberVirtualDisplayPreset(preset) {
+function rememberVirtualDisplayPreset(preset, saveOptions = {}) {
   const normalized = normalizeDisplayPreset(preset);
   const nextConfig = {
     ...config,
@@ -1266,7 +1291,10 @@ function rememberVirtualDisplayPreset(preset) {
       lastPresetId: normalized.id
     }
   };
-  saveConfig(nextConfig, { preserveFloatingBounds: true });
+  saveConfig(nextConfig, {
+    preserveFloatingBounds: true,
+    ...saveOptions
+  });
   return config.displayPresets.find((item) => item.id === normalized.id) || normalized;
 }
 
@@ -1301,7 +1329,44 @@ function canTryCompatibleProfile(result) {
   );
 }
 
-async function applyDisplayPreset(preset, options = {}) {
+function displayProfilesDiffer(left, right) {
+  const leftDimensions = effectiveDisplayDimensions(left);
+  const rightDimensions = effectiveDisplayDimensions(right);
+  return (
+    left.orientation === right.orientation
+    && (
+      leftDimensions.width !== rightDimensions.width
+      || leftDimensions.height !== rightDimensions.height
+    )
+  );
+}
+
+function refreshProfileFor(profiles, candidateIndex) {
+  const candidate = profiles[candidateIndex];
+  return profiles.find((profile, index) => (
+    index !== candidateIndex && displayProfilesDiffer(candidate, profile)
+  ));
+}
+
+function beginVirtualDisplayIntent() {
+  clearTimeout(virtualDisplayRestoreTimer);
+  virtualDisplayRestoreTimer = undefined;
+  clearTimeout(virtualDisplayVerifyTimer);
+  virtualDisplayVerifyTimer = undefined;
+  return virtualDisplayIntent.begin();
+}
+
+function applyDisplayPreset(preset, options = {}) {
+  const intentRevision = Number.isInteger(options.intentRevision)
+    ? options.intentRevision
+    : virtualDisplayIntent.current();
+  return virtualDisplayIntent.enqueue(
+    intentRevision,
+    () => applyDisplayPresetNow(preset, { ...options, intentRevision })
+  );
+}
+
+async function applyDisplayPresetNow(preset, options = {}) {
   const profiles = compatibleDisplayProfiles(preset);
   const requestedIndex = Number.isInteger(options.candidateIndex)
     ? clamp(options.candidateIndex, 0, profiles.length - 1)
@@ -1317,7 +1382,46 @@ async function applyDisplayPreset(preset, options = {}) {
   const results = [];
 
   for (const candidateIndex of candidateIndexes) {
+    if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
+      return { ok: false, stale: true, results };
+    }
     const candidate = profiles[candidateIndex];
+    if (options.refreshIfMatching) {
+      const currentStatus = await readVirtualDisplayStatus();
+      if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
+        return { ok: false, stale: true, results };
+      }
+      const refreshProfile = displayStatusMatchesPreset(currentStatus, candidate)
+        ? refreshProfileFor(profiles, candidateIndex)
+        : null;
+      if (refreshProfile) {
+        virtualDisplaySuppressUntil = Date.now() + 8000;
+        const refreshResult = await applyVirtualDisplayProfile(
+          refreshProfile,
+          config.virtualDisplay.adapterName,
+          { forceMode: true }
+        );
+        rememberVirtualDisplayStatus(refreshResult);
+        results.push({
+          step: refreshResult.step || 'display-refresh',
+          ...refreshResult,
+          refresh: true,
+          candidateIndex,
+          profile: refreshProfile
+        });
+        if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
+          return { ok: false, stale: true, results };
+        }
+        if (!refreshResult.ok) {
+          return {
+            ok: false,
+            preset: candidate,
+            candidateIndex,
+            results
+          };
+        }
+      }
+    }
     virtualDisplaySuppressUntil = Date.now() + 5000;
     const displayResult = await applyVirtualDisplayProfile(candidate, config.virtualDisplay.adapterName, {
       forceMode: options.forceMode === true
@@ -1329,6 +1433,10 @@ async function applyDisplayPreset(preset, options = {}) {
       candidateIndex,
       profile: candidate
     });
+
+    if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
+      return { ok: false, stale: true, results };
+    }
 
     if (displayResult.ok) {
       virtualDisplaySessionResolution = {
@@ -1403,9 +1511,18 @@ function scheduleVirtualDisplayRestore(delay = 1500) {
   }, delay);
 }
 
+function scheduleVirtualDisplayRestoreForActiveSession(delay) {
+  if (gameViewerSessionConnected !== true) return;
+  scheduleVirtualDisplayRestore(delay);
+}
+
 async function runVirtualDisplayRestore(context = {}) {
   if (virtualDisplayRestoreInProgress || !config?.virtualDisplay?.autoRestore) return;
   if (Date.now() < virtualDisplaySuppressUntil) return;
+  const intentRevision = Number.isInteger(context.intentRevision)
+    ? context.intentRevision
+    : virtualDisplayIntent.current();
+  if (!virtualDisplayIntent.isCurrent(intentRevision)) return;
   virtualDisplayRestoreInProgress = true;
   try {
     const requestedPreset = context.requestedPreset || getAutoRestorePreset();
@@ -1417,6 +1534,7 @@ async function runVirtualDisplayRestore(context = {}) {
       : (rememberedIndex >= 0 ? rememberedIndex : 0);
     const expectedPreset = profiles[candidateIndex];
     const status = await readVirtualDisplayStatus();
+    if (!virtualDisplayIntent.isCurrent(intentRevision)) return;
     if (!status.connected) {
       virtualDisplaySessionResolution = undefined;
       return;
@@ -1427,8 +1545,11 @@ async function runVirtualDisplayRestore(context = {}) {
       candidateIndex: Number.isInteger(context.candidateIndex) ? candidateIndex : undefined,
       preferSession,
       forceMode: context.forceMode === true,
-      allowFallback: !Number.isInteger(context.candidateIndex) || candidateIndex < profiles.length - 1
+      allowFallback: !Number.isInteger(context.candidateIndex) || candidateIndex < profiles.length - 1,
+      refreshIfMatching: context.refreshIfMatching === true,
+      intentRevision
     });
+    if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return;
     if (!result.ok) {
       notifyVirtualDisplayFailure(result.results.at(-1)?.error);
       return;
@@ -1441,6 +1562,8 @@ async function runVirtualDisplayRestore(context = {}) {
         appliedPreset: result.preset,
         candidateIndex: result.candidateIndex,
         forceMode: context.forceMode === true,
+        refreshIfMatching: context.refreshIfMatching === true,
+        intentRevision,
         retryCount: result.candidateIndex === candidateIndex
           ? (Number(context.retryCount) || 0)
           : 0
@@ -1454,7 +1577,9 @@ async function runVirtualDisplayRestore(context = {}) {
 
 async function verifyVirtualDisplayRestore(context) {
   if (!config?.virtualDisplay?.autoRestore) return;
+  if (!virtualDisplayIntent.isCurrent(context.intentRevision)) return;
   const status = await readVirtualDisplayStatus();
+  if (!virtualDisplayIntent.isCurrent(context.intentRevision)) return;
   if (!status.connected) {
     virtualDisplaySessionResolution = undefined;
     return;
@@ -1466,7 +1591,9 @@ async function verifyVirtualDisplayRestore(context) {
       requestedPreset: context.requestedPreset,
       candidateIndex: context.candidateIndex,
       forceMode: context.forceMode === true,
-      retryCount: context.retryCount + 1
+      refreshIfMatching: context.refreshIfMatching === true,
+      retryCount: context.retryCount + 1,
+      intentRevision: context.intentRevision
     });
     return;
   }
@@ -1503,70 +1630,20 @@ async function readVirtualDisplayStatus() {
   );
 }
 
-function scheduleRemoteSessionCheck(delay = 2200, options = {}) {
-  if (!config) return;
-  if (options.forceSync) remoteSessionForceSync = true;
-  if (options.entrySync) remoteSessionEntrySync = true;
-  clearTimeout(remoteSessionTimer);
-  remoteSessionTimer = setTimeout(() => {
-    remoteSessionTimer = undefined;
-    runRemoteSessionCheck();
-  }, delay);
-}
-
-function virtualDisplayConnectionValue(status) {
-  if (status?.connected) return true;
-  if (status?.step === 'detect') return false;
-  return undefined;
-}
-
-async function runRemoteSessionCheck() {
-  if (remoteSessionCheckInProgress) {
-    remoteSessionCheckQueued = true;
+function syncRemoteMicrophone(connected) {
+  const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
+  if (!automation.microphoneEnabled || connected === undefined) {
+    shandianshuoAudioController?.cancelPending();
     return;
   }
-
-  remoteSessionCheckInProgress = true;
-  const forceSync = remoteSessionForceSync;
-  const entrySync = remoteSessionEntrySync;
-  remoteSessionForceSync = false;
-  remoteSessionEntrySync = false;
-  try {
-    const firstStatus = await readVirtualDisplayStatus();
-    const nextConnected = virtualDisplayConnectionValue(firstStatus);
-    if (nextConnected === undefined) return;
-
-    const connectionChanged = virtualDisplayConnected === undefined || virtualDisplayConnected !== nextConnected;
-    if (connectionChanged) {
-      await wait(700);
-      const confirmedStatus = await readVirtualDisplayStatus();
-      if (virtualDisplayConnectionValue(confirmedStatus) !== nextConnected) {
-        scheduleRemoteSessionCheck(1200, { forceSync, entrySync });
-        return;
-      }
-    }
-
-    if (!connectionChanged && !forceSync && !entrySync) return;
-    virtualDisplayConnected = nextConnected;
-    await applyRemoteSessionAutomation(nextConnected, { connectionChanged, entrySync });
-  } finally {
-    remoteSessionCheckInProgress = false;
-    if (remoteSessionCheckQueued) {
-      remoteSessionCheckQueued = false;
-      scheduleRemoteSessionCheck(300);
-    }
-  }
+  shandianshuoAudioController?.requestDevice(
+    connected ? automation.remoteAudioDevice : automation.localAudioDevice
+  );
 }
 
 async function applyRemoteSessionAutomation(connected, options = {}) {
   const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
-  if (automation.microphoneEnabled) {
-    shandianshuoAudioController?.requestDevice(
-      connected ? automation.remoteAudioDevice : automation.localAudioDevice
-    );
-  } else {
-    shandianshuoAudioController?.cancelPending();
-  }
+  syncRemoteMicrophone(connected);
 
   if (connected && config.virtualDisplay.autoRestore) {
     clearTimeout(virtualDisplayRestoreTimer);
@@ -1577,13 +1654,36 @@ async function applyRemoteSessionAutomation(connected, options = {}) {
     }
     await runVirtualDisplayRestore({
       preferSession: options.connectionChanged || options.entrySync ? false : undefined,
-      forceMode: Boolean(options.connectionChanged || options.entrySync)
+      forceMode: Boolean(options.connectionChanged || options.entrySync),
+      refreshIfMatching: options.refreshIfMatching === true,
+      intentRevision: options.intentRevision
     });
   }
 
   if ((options.connectionChanged || options.entrySync) && automation.resetFloatingWindow) {
     scheduleFloatingWindowReset(800);
   }
+}
+
+function scheduleGameViewerSessionAutomation(connected) {
+  gameViewerSessionConnected = connected;
+  clearTimeout(gameViewerSessionAutomationTimer);
+  const intentRevision = beginVirtualDisplayIntent();
+  gameViewerSessionAutomationTimer = setTimeout(() => {
+    gameViewerSessionAutomationTimer = undefined;
+    applyRemoteSessionAutomation(connected, {
+      connectionChanged: true,
+      entrySync: connected,
+      refreshIfMatching: connected,
+      intentRevision
+    }).catch((error) => notifyVirtualDisplayFailure(error.message));
+  }, connected ? 700 : 250);
+}
+
+function registerGameViewerSessionAutomation() {
+  gameViewerSessionWatcher = new GameViewerSessionWatcher({
+    onSessionChanged: ({ connected }) => scheduleGameViewerSessionAutomation(connected)
+  }).start();
 }
 
 function notifyRemoteAutomationFailure(message) {
@@ -1619,15 +1719,12 @@ async function getShandianshuoAudioDevices() {
 
 function registerVirtualDisplayAutomation() {
   const schedule = () => {
-    const selfTriggered = Date.now() < virtualDisplaySuppressUntil;
-    scheduleRemoteSessionCheck(1800, selfTriggered
-      ? {}
-      : { forceSync: true, entrySync: true });
+    if (Date.now() < virtualDisplaySuppressUntil) return;
+    scheduleVirtualDisplayRestoreForActiveSession(1800);
   };
   screen.on('display-added', schedule);
   screen.on('display-metrics-changed', schedule);
   screen.on('display-removed', schedule);
-  scheduleRemoteSessionCheck(300, { forceSync: true, entrySync: true });
 }
 
 function startRepeatShortcut(shortcut) {
@@ -1768,6 +1865,16 @@ if (!gotSingleInstanceLock) {
       floatingWindow.showInactive();
       floatingWindow.setAlwaysOnTop(true, 'screen-saver');
     }
+
+    if (!config) return;
+    if (config.remoteAutomation.resetFloatingWindow) {
+      scheduleFloatingWindowReset(100);
+    }
+    if (gameViewerSessionConnected === true) {
+      applyDisplayPresetFromTray(getAutoRestorePreset()).catch((error) => {
+        notifyVirtualDisplayFailure(error.message);
+      });
+    }
   });
 
   app.whenReady().then(() => {
@@ -1782,6 +1889,7 @@ if (!gotSingleInstanceLock) {
     createFloatingWindow();
     createTray();
     ensureInputSender();
+    registerGameViewerSessionAutomation();
     registerVirtualDisplayAutomation();
 
     app.on('activate', () => {
@@ -1792,8 +1900,9 @@ if (!gotSingleInstanceLock) {
   app.on('before-quit', () => {
     clearTimeout(virtualDisplayRestoreTimer);
     clearTimeout(virtualDisplayVerifyTimer);
-    clearTimeout(remoteSessionTimer);
+    clearTimeout(gameViewerSessionAutomationTimer);
     clearTimeout(floatingResetTimer);
+    gameViewerSessionWatcher?.dispose();
     shandianshuoAudioController?.dispose();
     stopInputSender();
   });
