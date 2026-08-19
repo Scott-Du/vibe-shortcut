@@ -34,6 +34,19 @@ test('parses real-time UU desktop client state events', () => {
   );
 });
 
+test('parses current UU controlled-session state events', () => {
+  const events = parseGameViewerSessionEvents([
+    '[14:31:29.495 I] Client.Session: controlled_session result=changed previous_connected=0 current_connected=1 (@ home_controlled_session_presenter.cpp:87)',
+    '[14:33:27.234 I] Client.Session: controlled_session result=changed previous_connected=1 current_connected=1 (@ home_controlled_session_presenter.cpp:87)',
+    '[14:35:50.428 I] Client.Session: controlled_session result=changed previous_connected=1 current_connected=0 (@ home_controlled_session_presenter.cpp:87)'
+  ].join('\n'));
+
+  assert.deepEqual(
+    events.map((event) => event.connected),
+    [true, true, false]
+  );
+});
+
 test('ignores unrelated GameViewer log lines', () => {
   assert.deepEqual(
     parseGameViewerSessionEvents('[I] current screen rect width:2000 height:1200'),

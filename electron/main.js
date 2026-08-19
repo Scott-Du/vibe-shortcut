@@ -4,10 +4,13 @@ const fs = require('fs');
 const path = require('path');
 const {
   GAMEVIEWER_ADAPTER_NAME,
+  applyVirtualDisplayCandidates,
   applyVirtualDisplayProfile,
+  createDisplayRefreshProfiles,
   createLatestIntentQueue,
   getVirtualDisplayStatus,
-  orderVirtualDisplayProfileIndexes
+  orderVirtualDisplayProfileIndexes,
+  refreshVirtualDisplayProfile
 } = require('./virtual-display');
 const { GameViewerSessionWatcher } = require('./gameviewer-session');
 const {
@@ -16,8 +19,15 @@ const {
   ShandianshuoAudioController,
   listCaptureDevices
 } = require('./shandianshuo-audio');
+const {
+  isDoubaoVoiceShortcut,
+  shortcutNeedsNativeSender,
+  shortcutToNativeEvents
+} = require('./shortcut-input');
 
 const DEV_URL = 'http://127.0.0.1:5173';
+const LIGHTNING_VOICE_IMAGE = 'vibe-asset://voice-lightning.png';
+const DOUBAO_VOICE_IMAGE = 'vibe-asset://voice-doubao.png';
 const DEFAULT_PUNCTUATION_ITEMS = [
   { id: 'comma', label: '逗号', text: '，' },
   { id: 'period', label: '句号', text: '。' },
@@ -103,7 +113,7 @@ const DEFAULT_CONFIG = {
         label: '闪电说',
         iconType: 'image',
         icon: 'Zap',
-        image: 'vibe-asset://voice-lightning.png',
+        image: LIGHTNING_VOICE_IMAGE,
         shortcut: 'Ctrl+I'
       }
     }
@@ -315,6 +325,14 @@ function mergeVoiceModes(value, legacyVoiceButton, schemaVersion) {
       if (id === 'wechat' && (!option.shortcut || option.shortcut === 'Ctrl+Alt+W')) {
         options[id].shortcut = fallback.shortcut;
       }
+    }
+
+    const usesBundledLightningImage =
+      id === 'lightning'
+      && options[id].iconType === 'image'
+      && options[id].image === LIGHTNING_VOICE_IMAGE;
+    if (usesBundledLightningImage && /(?:豆包|doubao)/i.test(options[id].label)) {
+      options[id].image = DOUBAO_VOICE_IMAGE;
     }
   }
 
@@ -795,117 +813,17 @@ function shortcutToSendKeys(shortcut) {
   return `${prefix}{${key.toUpperCase()}}`;
 }
 
-function shortcutNeedsNativeSender(shortcut) {
-  const parts = String(shortcut || '')
-    .split('+')
-    .map((part) => part.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (!parts.length) return false;
-  return parts.some((part) => ['win', 'meta', 'cmd'].includes(part)) || parts.every(isModifierPart);
-}
-
-function isModifierPart(value) {
-  return ['ctrl', 'control', 'shift', 'alt', 'option', 'win', 'meta', 'cmd'].includes(value);
-}
-
-function shortcutToNativeEvents(shortcut) {
-  const parts = String(shortcut || '')
-    .split('+')
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  const modifiers = [];
-  let key = null;
-
-  for (const part of parts) {
-    const normalized = part.toLowerCase();
-    if (normalized === 'ctrl' || normalized === 'control') modifiers.push({ name: 'Ctrl', vk: 0x11 });
-    else if (normalized === 'shift') modifiers.push({ name: 'Shift', vk: 0x10 });
-    else if (normalized === 'alt' || normalized === 'option') modifiers.push({ name: 'Alt', vk: 0x12 });
-    else if (normalized === 'win' || normalized === 'meta' || normalized === 'cmd') modifiers.push({ name: 'Win', vk: 0x5b });
-    else key = part;
-  }
-
-  const events = [];
-  const uniqueModifiers = [];
-  for (const modifier of modifiers) {
-    if (!uniqueModifiers.some((item) => item.vk === modifier.vk)) uniqueModifiers.push(modifier);
-  }
-
-  for (const modifier of uniqueModifiers) events.push(keyEvent(modifier.vk, false));
-
-  if (key) {
-    const keyVk = keyToVirtualKey(key);
-    if (!keyVk) throw new Error(`Native sender does not support ${key}.`);
-    events.push(keyEvent(keyVk, false));
-    events.push(keyEvent(keyVk, true));
-  }
-
-  for (const modifier of [...uniqueModifiers].reverse()) events.push(keyEvent(modifier.vk, true));
-  return events;
-}
-
-function keyEvent(vk, up) {
-  return { vk, up, extended: isExtendedVirtualKey(vk) };
-}
-
-function keyToVirtualKey(key) {
-  const normalized = key.toLowerCase();
-  const special = {
-    enter: 0x0d,
-    return: 0x0d,
-    backspace: 0x08,
-    delete: 0x2e,
-    del: 0x2e,
-    esc: 0x1b,
-    escape: 0x1b,
-    tab: 0x09,
-    space: 0x20,
-    up: 0x26,
-    arrowup: 0x26,
-    down: 0x28,
-    arrowdown: 0x28,
-    left: 0x25,
-    arrowleft: 0x25,
-    right: 0x27,
-    arrowright: 0x27,
-    home: 0x24,
-    end: 0x23,
-    pageup: 0x21,
-    pagedown: 0x22,
-    insert: 0x2d
-  };
-
-  if (special[normalized]) return special[normalized];
-  if (/^f([1-9]|1[0-9]|2[0-4])$/i.test(key)) return 0x70 + Number(key.slice(1)) - 1;
-  if (/^[a-z]$/i.test(key)) return key.toUpperCase().charCodeAt(0);
-  if (/^[0-9]$/.test(key)) return key.charCodeAt(0);
-  return null;
-}
-
-function isExtendedVirtualKey(vk) {
-  return new Set([
-    0x21, // PageUp
-    0x22, // PageDown
-    0x23, // End
-    0x24, // Home
-    0x25, // Left
-    0x26, // Up
-    0x27, // Right
-    0x28, // Down
-    0x2d, // Insert
-    0x2e, // Delete
-    0x5b // Left Windows
-  ]).has(vk);
-}
-
 function inputSenderScript() {
   return `
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @'
 using System;
+using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
 public static class NativeInput {
   [StructLayout(LayoutKind.Sequential)] public struct INPUT { public UInt32 type; public INPUTUNION u; }
   [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
@@ -924,6 +842,21 @@ public static class NativeInput {
   }
   [DllImport("user32.dll", SetLastError=true)] public static extern UInt32 SendInput(UInt32 nInputs, INPUT[] pInputs, Int32 cbSize);
   [DllImport("user32.dll")] public static extern UInt32 MapVirtualKey(UInt32 uCode, UInt32 uMapType);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern UInt32 GetWindowThreadProcessId(IntPtr hWnd, out UInt32 processId);
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(UInt32 idAttach, UInt32 idAttachTo, bool attach);
+  [DllImport("kernel32.dll")] static extern UInt32 GetCurrentThreadId();
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr LoadLibraryW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate UInt32 RpcFocus(IntPtr context);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate UInt32 RpcSimpleMessage(IntPtr context, UInt32 message, UInt32 param1, UInt32 param2);
+  static IntPtr doubaoRpcModule;
+  static RpcFocus doubaoFocusIn;
+  static RpcFocus doubaoFocusOut;
+  static RpcSimpleMessage doubaoSimpleMessage;
   public static void SendChar(UInt16 scan, bool keyUp) {
     INPUT[] inputs = new INPUT[1];
     inputs[0].type = 1;
@@ -946,8 +879,89 @@ public static class NativeInput {
     UInt32 sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     if (sent == 0) throw new InvalidOperationException("SendInput failed " + Marshal.GetLastWin32Error());
   }
+  static T LoadExport<T>(string name) where T : class {
+    IntPtr address = GetProcAddress(doubaoRpcModule, name);
+    if (address == IntPtr.Zero) throw new InvalidOperationException("Doubao RPC export is missing: " + name);
+    return Marshal.GetDelegateForFunctionPointer(address, typeof(T)) as T;
+  }
+  static void EnsureDoubaoRpc(string rpcPath) {
+    if (doubaoRpcModule != IntPtr.Zero) return;
+    doubaoRpcModule = LoadLibraryW(rpcPath);
+    if (doubaoRpcModule == IntPtr.Zero) {
+      throw new InvalidOperationException("Unable to load Doubao RPC library " + Marshal.GetLastWin32Error());
+    }
+    doubaoFocusIn = LoadExport<RpcFocus>("RpcPipe_FocusIn");
+    doubaoFocusOut = LoadExport<RpcFocus>("RpcPipe_FocusOut");
+    doubaoSimpleMessage = LoadExport<RpcSimpleMessage>("RpcPipe_SimpleMessage");
+  }
+  static void MakeForeground(IntPtr target, bool setFocus) {
+    UInt32 processId;
+    UInt32 currentThread = GetCurrentThreadId();
+    UInt32 foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), out processId);
+    UInt32 targetThread = GetWindowThreadProcessId(target, out processId);
+    bool attachedForeground = foregroundThread != 0
+      && foregroundThread != currentThread
+      && AttachThreadInput(currentThread, foregroundThread, true);
+    bool attachedTarget = targetThread != 0
+      && targetThread != currentThread
+      && targetThread != foregroundThread
+      && AttachThreadInput(currentThread, targetThread, true);
+
+    try {
+      BringWindowToTop(target);
+      SetForegroundWindow(target);
+      if (setFocus) SetFocus(target);
+    } finally {
+      if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+      if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+    }
+  }
+  public static void ToggleDoubaoVoice(string rpcPath, string pipeName) {
+    EnsureDoubaoRpc(rpcPath);
+    IntPtr previousForeground = GetForegroundWindow();
+    IntPtr rpcContext = Marshal.StringToHGlobalAnsi(pipeName);
+    Form focusWindow = new Form();
+    bool focusRegistered = false;
+
+    try {
+      focusWindow.FormBorderStyle = FormBorderStyle.None;
+      focusWindow.ShowInTaskbar = false;
+      focusWindow.StartPosition = FormStartPosition.Manual;
+      focusWindow.Location = new Point(-32000, -32000);
+      focusWindow.Size = new Size(1, 1);
+      focusWindow.Opacity = 0.01;
+      focusWindow.Show();
+      focusWindow.Activate();
+      Application.DoEvents();
+      MakeForeground(focusWindow.Handle, true);
+
+      for (int attempt = 0; attempt < 5 && GetForegroundWindow() != focusWindow.Handle; attempt++) {
+        Application.DoEvents();
+        Thread.Sleep(10);
+        MakeForeground(focusWindow.Handle, true);
+      }
+      if (GetForegroundWindow() != focusWindow.Handle) {
+        throw new InvalidOperationException("Unable to acquire temporary foreground focus for Doubao voice input.");
+      }
+
+      Thread.Sleep(30);
+      doubaoFocusIn(rpcContext);
+      focusRegistered = true;
+      doubaoSimpleMessage(rpcContext, 0x3e9, 0, 0);
+      Thread.Sleep(120);
+    } finally {
+      if (focusRegistered) doubaoFocusOut(rpcContext);
+      if (previousForeground != IntPtr.Zero) {
+        MakeForeground(previousForeground, false);
+        Application.DoEvents();
+      }
+      focusWindow.Hide();
+      focusWindow.Dispose();
+      Marshal.FreeHGlobal(rpcContext);
+    }
+  }
 }
-'@
+'@ -ReferencedAssemblies System.Windows.Forms,System.Drawing
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
   $id = ''
@@ -965,6 +979,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         Start-Sleep -Milliseconds 8
       } elseif ($action.type -eq 'sleep') {
         Start-Sleep -Milliseconds ([int]$action.ms)
+      } elseif ($action.type -eq 'doubaoVoice') {
+        [NativeInput]::ToggleDoubaoVoice([string]$action.rpcPath, [string]$action.pipeName)
       }
     }
     [pscustomobject]@{ id = $id; ok = $true } | ConvertTo-Json -Compress
@@ -1104,6 +1120,26 @@ function sendNativeShortcut(shortcut) {
   return sendNativeEvents(events);
 }
 
+function findDoubaoRpcPath() {
+  const roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean);
+  for (const root of roots) {
+    const candidate = path.join(root, 'DoubaoIME', 'rpc.dll');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return '';
+}
+
+function sendDoubaoVoiceShortcut(shortcut, context) {
+  if (!isDoubaoVoiceShortcut(shortcut, context)) return null;
+  const rpcPath = findDoubaoRpcPath();
+  if (!rpcPath) return Promise.resolve({ ok: false, error: 'Doubao IME RPC library was not found.' });
+  return sendInputActions([{
+    type: 'doubaoVoice',
+    rpcPath,
+    pipeName: '\\\\.\\pipe\\ObricIme\\oime-server'
+  }]);
+}
+
 function sendNativeShortcutSequence(shortcuts) {
   const events = [];
 
@@ -1185,7 +1221,10 @@ function escapeSendKeysChar(value) {
   return value.replace(/[+^%~()[\]{}]/g, '{$&}');
 }
 
-function sendShortcut(shortcut) {
+function sendShortcut(shortcut, context) {
+  const doubaoResult = sendDoubaoVoiceShortcut(shortcut, context);
+  if (doubaoResult) return doubaoResult;
+
   return sendNativeShortcut(shortcut).then((nativeResult) => {
     if (nativeResult.ok || shortcutNeedsNativeSender(shortcut)) return nativeResult;
 
@@ -1236,7 +1275,7 @@ async function applyDisplayPresetFromTray(preset) {
   const result = await applyDisplayPreset(normalized, {
     preferSession: false,
     forceMode: true,
-    refreshIfMatching: true,
+    roundTripIfMatching: true,
     intentRevision
   });
   if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return result;
@@ -1329,25 +1368,6 @@ function canTryCompatibleProfile(result) {
   );
 }
 
-function displayProfilesDiffer(left, right) {
-  const leftDimensions = effectiveDisplayDimensions(left);
-  const rightDimensions = effectiveDisplayDimensions(right);
-  return (
-    left.orientation === right.orientation
-    && (
-      leftDimensions.width !== rightDimensions.width
-      || leftDimensions.height !== rightDimensions.height
-    )
-  );
-}
-
-function refreshProfileFor(profiles, candidateIndex) {
-  const candidate = profiles[candidateIndex];
-  return profiles.find((profile, index) => (
-    index !== candidateIndex && displayProfilesDiffer(candidate, profile)
-  ));
-}
-
 function beginVirtualDisplayIntent() {
   clearTimeout(virtualDisplayRestoreTimer);
   virtualDisplayRestoreTimer = undefined;
@@ -1379,88 +1399,63 @@ async function applyDisplayPresetNow(preset, options = {}) {
     allowFallback: options.allowFallback
   });
   const firstIndex = candidateIndexes[0];
-  const results = [];
-
-  for (const candidateIndex of candidateIndexes) {
-    if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
-      return { ok: false, stale: true, results };
-    }
-    const candidate = profiles[candidateIndex];
-    if (options.refreshIfMatching) {
-      const currentStatus = await readVirtualDisplayStatus();
-      if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
-        return { ok: false, stale: true, results };
-      }
-      const refreshProfile = displayStatusMatchesPreset(currentStatus, candidate)
-        ? refreshProfileFor(profiles, candidateIndex)
-        : null;
-      if (refreshProfile) {
-        virtualDisplaySuppressUntil = Date.now() + 8000;
-        const refreshResult = await applyVirtualDisplayProfile(
-          refreshProfile,
-          config.virtualDisplay.adapterName,
-          { forceMode: true }
+  const result = await applyVirtualDisplayCandidates(
+    profiles,
+    candidateIndexes,
+    async (candidate, candidateIndex) => {
+      const applyProfile = async (profile) => {
+        virtualDisplaySuppressUntil = Date.now() + 12000;
+        return rememberVirtualDisplayStatus(
+          await applyVirtualDisplayProfile(profile, config.virtualDisplay.adapterName, {
+            forceMode: true
+          })
         );
-        rememberVirtualDisplayStatus(refreshResult);
-        results.push({
-          step: refreshResult.step || 'display-refresh',
-          ...refreshResult,
-          refresh: true,
-          candidateIndex,
-          profile: refreshProfile
-        });
+      };
+
+      if (options.roundTripIfMatching) {
+        const currentStatus = await readVirtualDisplayStatus();
         if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
-          return { ok: false, stale: true, results };
+          return { ok: false, stale: true };
         }
-        if (!refreshResult.ok) {
-          return {
-            ok: false,
-            preset: candidate,
-            candidateIndex,
-            results
-          };
+        if (displayStatusMatchesPreset(currentStatus, candidate)) {
+          return refreshVirtualDisplayProfile(
+            candidate,
+            createDisplayRefreshProfiles(profiles, candidateIndex),
+            applyProfile,
+            {
+              isCurrent: () => virtualDisplayIntent.isCurrent(options.intentRevision),
+              canContinue: canTryCompatibleProfile
+            }
+          );
         }
       }
-    }
-    virtualDisplaySuppressUntil = Date.now() + 5000;
-    const displayResult = await applyVirtualDisplayProfile(candidate, config.virtualDisplay.adapterName, {
-      forceMode: options.forceMode === true
-    });
-    rememberVirtualDisplayStatus(displayResult);
-    results.push({
-      step: displayResult.step || 'display',
-      ...displayResult,
-      candidateIndex,
-      profile: candidate
-    });
 
-    if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
-      return { ok: false, stale: true, results };
+      virtualDisplaySuppressUntil = Date.now() + 5000;
+      return rememberVirtualDisplayStatus(
+        await applyVirtualDisplayProfile(candidate, config.virtualDisplay.adapterName, {
+          forceMode: options.forceMode === true
+        })
+      );
+    },
+    {
+      isCurrent: () => virtualDisplayIntent.isCurrent(options.intentRevision),
+      canContinue: (displayResult) => (
+        options.allowFallback !== false && canTryCompatibleProfile(displayResult)
+      )
     }
+  );
 
-    if (displayResult.ok) {
-      virtualDisplaySessionResolution = {
-        width: candidate.width,
-        height: candidate.height,
-        deviceName: displayResult.deviceName || ''
-      };
-      return {
-        ok: true,
-        preset: candidate,
-        candidateIndex,
-        results
-      };
-    }
-
-    if (options.allowFallback === false || !canTryCompatibleProfile(displayResult)) break;
+  if (result.ok) {
+    virtualDisplaySessionResolution = {
+      width: result.preset.width,
+      height: result.preset.height,
+      deviceName: result.results.at(-1)?.deviceName || ''
+    };
   }
 
-  return {
-    ok: false,
-    preset: profiles[firstIndex],
-    candidateIndex: firstIndex,
-    results
-  };
+  return result.candidateIndex >= 0
+    ? result
+    : { ...result, preset: profiles[firstIndex], candidateIndex: firstIndex };
 }
 
 function getAutoRestorePreset() {
@@ -1546,7 +1541,7 @@ async function runVirtualDisplayRestore(context = {}) {
       preferSession,
       forceMode: context.forceMode === true,
       allowFallback: !Number.isInteger(context.candidateIndex) || candidateIndex < profiles.length - 1,
-      refreshIfMatching: context.refreshIfMatching === true,
+      roundTripIfMatching: context.roundTripIfMatching === true,
       intentRevision
     });
     if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return;
@@ -1562,7 +1557,7 @@ async function runVirtualDisplayRestore(context = {}) {
         appliedPreset: result.preset,
         candidateIndex: result.candidateIndex,
         forceMode: context.forceMode === true,
-        refreshIfMatching: context.refreshIfMatching === true,
+        roundTripIfMatching: context.roundTripIfMatching === true,
         intentRevision,
         retryCount: result.candidateIndex === candidateIndex
           ? (Number(context.retryCount) || 0)
@@ -1591,7 +1586,7 @@ async function verifyVirtualDisplayRestore(context) {
       requestedPreset: context.requestedPreset,
       candidateIndex: context.candidateIndex,
       forceMode: context.forceMode === true,
-      refreshIfMatching: context.refreshIfMatching === true,
+      roundTripIfMatching: context.roundTripIfMatching === true,
       retryCount: context.retryCount + 1,
       intentRevision: context.intentRevision
     });
@@ -1655,7 +1650,7 @@ async function applyRemoteSessionAutomation(connected, options = {}) {
     await runVirtualDisplayRestore({
       preferSession: options.connectionChanged || options.entrySync ? false : undefined,
       forceMode: Boolean(options.connectionChanged || options.entrySync),
-      refreshIfMatching: options.refreshIfMatching === true,
+      roundTripIfMatching: Boolean(options.connectionChanged || options.entrySync),
       intentRevision: options.intentRevision
     });
   }
@@ -1674,7 +1669,6 @@ function scheduleGameViewerSessionAutomation(connected) {
     applyRemoteSessionAutomation(connected, {
       connectionChanged: true,
       entrySync: connected,
-      refreshIfMatching: connected,
       intentRevision
     }).catch((error) => notifyVirtualDisplayFailure(error.message));
   }, connected ? 700 : 250);
@@ -1820,7 +1814,7 @@ function broadcastStartup(state = getStartupState()) {
 function registerIpc() {
   ipcMain.handle('config:get', () => config);
   ipcMain.handle('config:save', (_event, nextConfig, options) => saveConfig(nextConfig, options));
-  ipcMain.handle('shortcut:send', (_event, shortcut) => sendShortcut(shortcut));
+  ipcMain.handle('shortcut:send', (_event, shortcut, context) => sendShortcut(shortcut, context));
   ipcMain.handle('shortcut:sendSequence', (_event, shortcuts) => sendShortcutSequence(shortcuts));
   ipcMain.handle('text:send', (_event, text, afterShortcut) => sendText(text, afterShortcut));
   ipcMain.handle('text:insert', (_event, text, afterShortcut) => sendText(text, afterShortcut));

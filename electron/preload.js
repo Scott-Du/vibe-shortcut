@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('vibeShortcut', {
   getConfig: () => ipcRenderer.invoke('config:get'),
   saveConfig: (config, options) => ipcRenderer.invoke('config:save', config, options),
-  sendShortcut: (shortcut) => ipcRenderer.invoke('shortcut:send', shortcut),
+  sendShortcut: (shortcut, context) => ipcRenderer.invoke('shortcut:send', shortcut, context),
   sendShortcutSequence: (shortcuts) => ipcRenderer.invoke('shortcut:sendSequence', shortcuts),
   sendText: (text, afterShortcut) => ipcRenderer.invoke('text:send', text, afterShortcut),
   insertText: (text, afterShortcut) => ipcRenderer.invoke('text:send', text, afterShortcut),

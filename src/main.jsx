@@ -261,15 +261,19 @@ function FloatingPanel() {
     window.setTimeout(() => setActiveId(null), 160);
   }
 
-  async function triggerShortcut(id, shortcut) {
+  async function triggerShortcut(id, shortcut, context) {
     pulse(id);
-    await api.sendShortcut(shortcut);
+    await api.sendShortcut(shortcut, context);
   }
 
   async function triggerButton(button) {
     if (isVoiceButton(button)) {
       const activeMode = getActiveVoiceMode(config);
-      await triggerShortcut(`voice:${activeMode.id}`, activeMode.shortcut);
+      await triggerShortcut(`voice:${activeMode.id}`, activeMode.shortcut, {
+        kind: 'voice',
+        modeId: activeMode.id,
+        label: activeMode.label
+      });
       return;
     }
 
@@ -321,7 +325,11 @@ function FloatingPanel() {
     pressedButtonRef.current = null;
 
     if (isVoiceButton(button)) {
-      openVoiceSelector(button, { pulseButton: false });
+      if (sideActionType === 'voice') {
+        setSideActionType(null);
+      } else {
+        openVoiceSelector(button, { pulseButton: false });
+      }
       return;
     }
 

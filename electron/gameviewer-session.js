@@ -5,13 +5,17 @@ const CONNECT_PATTERN = 'report event: event_connect_start, suc: 1';
 const DISCONNECT_PATTERN = 'peer_control_connection: disconnected';
 const CLIENT_CONNECT_PATTERN = 'processChangeSelfDeviceInfo] connected, device id:';
 const CLIENT_DISCONNECT_PATTERN = 'processChangeSelfDeviceInfo] onEventDeviceInfoChanged disconnect';
+const CONTROLLED_SESSION_PATTERN = /controlled_session result=changed\b.*\bcurrent_connected=([01])\b/i;
 const GAMEVIEWER_LOG_PATTERN = /^log_.+\.txt$/i;
 const INITIAL_TAIL_BYTES = 12 * 1024 * 1024;
 
 function parseGameViewerSessionEvents(text) {
   const events = [];
   for (const line of String(text || '').split(/\r?\n/)) {
-    if (line.includes(CLIENT_CONNECT_PATTERN) || line.includes(CONNECT_PATTERN)) {
+    const controlledSession = line.match(CONTROLLED_SESSION_PATTERN);
+    if (controlledSession) {
+      events.push({ connected: controlledSession[1] === '1', line });
+    } else if (line.includes(CLIENT_CONNECT_PATTERN) || line.includes(CONNECT_PATTERN)) {
       events.push({ connected: true, line });
     } else if (line.includes(CLIENT_DISCONNECT_PATTERN) || line.includes(DISCONNECT_PATTERN)) {
       events.push({ connected: false, line });

@@ -709,6 +709,148 @@ function orderVirtualDisplayProfileIndexes(profileCount, options = {}) {
   return [firstIndex, ...indexes.filter((index) => index !== firstIndex)];
 }
 
+function oppositeDisplayOrientation(orientation) {
+  const opposites = {
+    landscape: 'portrait',
+    portrait: 'landscape',
+    'landscape-flipped': 'portrait-flipped',
+    'portrait-flipped': 'landscape-flipped'
+  };
+  return opposites[orientation] || 'landscape';
+}
+
+function createDisplayRefreshProfiles(profiles, candidateIndex) {
+  const candidate = profiles[candidateIndex];
+  if (!candidate) return [];
+
+  const otherProfiles = profiles.filter((_, index) => index !== candidateIndex);
+  const oppositeOrientation = oppositeDisplayOrientation(candidate.orientation);
+  const refreshProfiles = [
+    { ...candidate, orientation: oppositeOrientation },
+    ...otherProfiles.map((profile) => ({ ...profile, orientation: oppositeOrientation })),
+    ...otherProfiles
+  ];
+  const seen = new Set();
+
+  return refreshProfiles.filter((profile) => {
+    const key = [
+      Number(profile.width) || 0,
+      Number(profile.height) || 0,
+      Number(profile.scale) || 0,
+      profile.orientation
+    ].join(':');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function refreshVirtualDisplayProfile(candidate, refreshProfiles, applyProfile, options = {}) {
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
+  const canContinue = typeof options.canContinue === 'function' ? options.canContinue : () => true;
+  const refreshAttempts = [];
+  let lastResult;
+
+  for (const refreshProfile of refreshProfiles) {
+    if (!isCurrent()) {
+      return { ok: false, stale: true, refreshAttempts };
+    }
+
+    const transitionResult = await applyProfile(refreshProfile, { transition: true });
+    refreshAttempts.push({
+      ...transitionResult,
+      profile: refreshProfile,
+      transition: true
+    });
+    lastResult = transitionResult;
+
+    if (!isCurrent()) {
+      return { ok: false, stale: true, refreshAttempts };
+    }
+    if (!transitionResult.ok) {
+      if (!canContinue(transitionResult)) break;
+      continue;
+    }
+
+    const targetResult = await applyProfile(candidate, { transition: false });
+    refreshAttempts.push({
+      ...targetResult,
+      profile: candidate,
+      transition: false
+    });
+    lastResult = targetResult;
+
+    if (!isCurrent()) {
+      return { ok: false, stale: true, refreshAttempts };
+    }
+    if (targetResult.ok) {
+      return {
+        ...targetResult,
+        refreshed: true,
+        refreshAttempts
+      };
+    }
+    if (!canContinue(targetResult)) break;
+  }
+
+  return {
+    ...(lastResult || {
+      ok: false,
+      connected: true,
+      step: 'display-refresh',
+      error: '没有可用于刷新 UU 虚拟屏的过渡显示模式。'
+    }),
+    ok: false,
+    refreshed: false,
+    refreshAttempts
+  };
+}
+
+async function applyVirtualDisplayCandidates(profiles, candidateIndexes, applyCandidate, options = {}) {
+  const indexes = Array.isArray(candidateIndexes) ? candidateIndexes : [];
+  const firstIndex = indexes[0] ?? -1;
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
+  const canContinue = typeof options.canContinue === 'function' ? options.canContinue : () => true;
+  const results = [];
+
+  for (const candidateIndex of indexes) {
+    if (!isCurrent()) {
+      return { ok: false, stale: true, results };
+    }
+
+    const candidate = profiles[candidateIndex];
+    const displayResult = await applyCandidate(candidate, candidateIndex);
+    results.push({
+      ...displayResult,
+      step: displayResult.step || 'display',
+      candidateIndex,
+      profile: candidate
+    });
+
+    if (!isCurrent()) {
+      return { ok: false, stale: true, results };
+    }
+
+    if (displayResult.ok) {
+      return {
+        ok: true,
+        preset: candidate,
+        candidateIndex,
+        results
+      };
+    }
+
+    if (!canContinue(displayResult, candidateIndex)) break;
+  }
+
+  return {
+    ok: false,
+    preset: firstIndex >= 0 ? profiles[firstIndex] : undefined,
+    candidateIndex: firstIndex,
+    results
+  };
+}
+
 function createLatestIntentQueue() {
   let revision = 0;
   let queue = Promise.resolve();
@@ -741,8 +883,11 @@ function createLatestIntentQueue() {
 
 module.exports = {
   GAMEVIEWER_ADAPTER_NAME,
+  applyVirtualDisplayCandidates,
   applyVirtualDisplayProfile,
+  createDisplayRefreshProfiles,
   createLatestIntentQueue,
   getVirtualDisplayStatus,
-  orderVirtualDisplayProfileIndexes
+  orderVirtualDisplayProfileIndexes,
+  refreshVirtualDisplayProfile
 };
