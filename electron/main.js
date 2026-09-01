@@ -14,12 +14,6 @@ const {
 } = require('./virtual-display');
 const { GameViewerSessionWatcher } = require('./gameviewer-session');
 const {
-  DEFAULT_REMOTE_AUDIO_DEVICE,
-  SYSTEM_AUDIO_DEVICE,
-  ShandianshuoAudioController,
-  listCaptureDevices
-} = require('./shandianshuo-audio');
-const {
   isDoubaoVoiceShortcut,
   shortcutNeedsNativeSender,
   shortcutToNativeEvents
@@ -48,9 +42,6 @@ const DEFAULT_VIRTUAL_DISPLAY = {
   lastPresetId: 'preset-1'
 };
 const DEFAULT_REMOTE_AUTOMATION = {
-  microphoneEnabled: true,
-  localAudioDevice: SYSTEM_AUDIO_DEVICE,
-  remoteAudioDevice: DEFAULT_REMOTE_AUDIO_DEVICE,
   resetFloatingWindow: true
 };
 const WM_DISPLAYCHANGE = 0x007E;
@@ -147,7 +138,6 @@ let gameViewerSessionWatcher;
 let gameViewerSessionAutomationTimer;
 let nativeDisplayChangeAt = 0;
 let floatingResetTimer;
-let shandianshuoAudioController;
 const inputSenderPending = new Map();
 
 function configPath() {
@@ -281,13 +271,6 @@ function mergeVirtualDisplay(value, displayPresets) {
 function mergeRemoteAutomation(value) {
   const source = value && typeof value === 'object' ? value : {};
   return {
-    microphoneEnabled: source.microphoneEnabled !== false,
-    localAudioDevice: typeof source.localAudioDevice === 'string' && source.localAudioDevice.trim()
-      ? source.localAudioDevice.trim()
-      : DEFAULT_REMOTE_AUTOMATION.localAudioDevice,
-    remoteAudioDevice: typeof source.remoteAudioDevice === 'string' && source.remoteAudioDevice.trim()
-      ? source.remoteAudioDevice.trim()
-      : DEFAULT_REMOTE_AUTOMATION.remoteAudioDevice,
     resetFloatingWindow: source.resetFloatingWindow !== false
   };
 }
@@ -355,11 +338,9 @@ function loadConfig() {
 
 function saveConfig(nextConfig, options = {}) {
   const previousLayoutSignature = config ? floatingLayoutSignature(config) : null;
-  const previousRemoteSignature = config ? remoteAutomationSignature(config) : null;
   const previousDisplaySignature = config ? virtualDisplayConfigSignature(config) : null;
   config = mergeConfig(nextConfig);
   const nextLayoutSignature = floatingLayoutSignature(config);
-  const nextRemoteSignature = remoteAutomationSignature(config);
   const nextDisplaySignature = virtualDisplayConfigSignature(config);
   if (
     previousDisplaySignature !== null
@@ -386,9 +367,6 @@ function saveConfig(nextConfig, options = {}) {
     clearTimeout(virtualDisplayRestoreTimer);
     clearTimeout(virtualDisplayVerifyTimer);
   }
-  if (previousRemoteSignature !== nextRemoteSignature) {
-    syncRemoteMicrophone(gameViewerSessionConnected);
-  }
   return config;
 }
 
@@ -397,10 +375,6 @@ function floatingLayoutSignature(targetConfig) {
     window: targetConfig.window,
     buttonCount: Array.isArray(targetConfig.buttons) ? targetConfig.buttons.length : 0
   });
-}
-
-function remoteAutomationSignature(targetConfig) {
-  return JSON.stringify(targetConfig.remoteAutomation || DEFAULT_REMOTE_AUTOMATION);
 }
 
 function virtualDisplayConfigSignature(targetConfig) {
@@ -1625,20 +1599,8 @@ async function readVirtualDisplayStatus() {
   );
 }
 
-function syncRemoteMicrophone(connected) {
-  const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
-  if (!automation.microphoneEnabled || connected === undefined) {
-    shandianshuoAudioController?.cancelPending();
-    return;
-  }
-  shandianshuoAudioController?.requestDevice(
-    connected ? automation.remoteAudioDevice : automation.localAudioDevice
-  );
-}
-
 async function applyRemoteSessionAutomation(connected, options = {}) {
   const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
-  syncRemoteMicrophone(connected);
 
   if (connected && config.virtualDisplay.autoRestore) {
     clearTimeout(virtualDisplayRestoreTimer);
@@ -1678,37 +1640,6 @@ function registerGameViewerSessionAutomation() {
   gameViewerSessionWatcher = new GameViewerSessionWatcher({
     onSessionChanged: ({ connected }) => scheduleGameViewerSessionAutomation(connected)
   }).start();
-}
-
-function notifyRemoteAutomationFailure(message) {
-  if (tray && typeof tray.displayBalloon === 'function') {
-    tray.displayBalloon({
-      title: '闪电说麦克风切换失败',
-      content: message || '请检查闪电说和录音设备状态。'
-    });
-  }
-}
-
-function broadcastShandianshuoStatus(status) {
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    settingsWindow.webContents.send('shandianshuo:statusChanged', status);
-  }
-}
-
-async function getShandianshuoAudioDevices() {
-  const result = await listCaptureDevices();
-  const devices = [
-    { id: SYSTEM_AUDIO_DEVICE, label: '自动选择', active: true, system: true },
-    ...result.devices
-  ];
-  const knownIds = new Set(devices.map((device) => device.id));
-  for (const audioDevice of [config.remoteAutomation.localAudioDevice, config.remoteAutomation.remoteAudioDevice]) {
-    if (!knownIds.has(audioDevice)) {
-      devices.push({ id: audioDevice, label: audioDevice, active: false, system: false });
-      knownIds.add(audioDevice);
-    }
-  }
-  return { ok: result.ok, devices, error: result.error || '' };
 }
 
 function registerVirtualDisplayAutomation() {
@@ -1827,8 +1758,6 @@ function registerIpc() {
     updateTrayMenu();
     return state;
   });
-  ipcMain.handle('shandianshuo:listAudioDevices', () => getShandianshuoAudioDevices());
-  ipcMain.handle('shandianshuo:getStatus', () => shandianshuoAudioController?.getStatus() || null);
   ipcMain.handle('settings:open', () => createSettingsWindow());
   ipcMain.handle('settings:close', () => {
     if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.close();
@@ -1874,11 +1803,6 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     config = loadConfig();
     registerAssetProtocol();
-    shandianshuoAudioController = new ShandianshuoAudioController({
-      appDataPath: app.getPath('appData'),
-      notify: notifyRemoteAutomationFailure,
-      onStatusChanged: broadcastShandianshuoStatus
-    });
     registerIpc();
     createFloatingWindow();
     createTray();
@@ -1897,7 +1821,6 @@ if (!gotSingleInstanceLock) {
     clearTimeout(gameViewerSessionAutomationTimer);
     clearTimeout(floatingResetTimer);
     gameViewerSessionWatcher?.dispose();
-    shandianshuoAudioController?.dispose();
     stopInputSender();
   });
 

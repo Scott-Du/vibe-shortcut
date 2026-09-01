@@ -787,22 +787,6 @@ button {
   gap: 14px;
 }
 
-.remote-audio-fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-  transition: opacity 120ms ease;
-}
-
-.remote-audio-fields.is-disabled {
-  opacity: 0.56;
-}
-
-.remote-reset-switch {
-  padding-top: 14px;
-  border-top: 1px solid rgba(121, 138, 158, 0.14);
-}
-
 .virtual-display-target {
   padding-bottom: 14px;
   border-bottom: 1px solid rgba(121, 138, 158, 0.14);

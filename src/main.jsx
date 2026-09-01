@@ -31,9 +31,6 @@ const defaultVirtualDisplay = {
   lastPresetId: 'preset-1'
 };
 const defaultRemoteAutomation = {
-  microphoneEnabled: true,
-  localAudioDevice: 'system',
-  remoteAudioDevice: '麦克风阵列 (网易虚拟音频设备)',
   resetFloatingWindow: true
 };
 const SETTINGS_SECTIONS = [
@@ -154,22 +151,6 @@ const api = window.vibeShortcut || {
   setSideActionsOpen: async () => ({ ok: true }),
   getStartup: async () => ({ enabled: false, supported: false }),
   setStartup: async () => ({ enabled: false, supported: false }),
-  listShandianshuoAudioDevices: async () => ({
-    ok: true,
-    devices: [
-      { id: 'system', label: '自动选择', active: true, system: true },
-      { id: defaultRemoteAutomation.remoteAudioDevice, label: defaultRemoteAutomation.remoteAudioDevice, active: true }
-    ]
-  }),
-  getShandianshuoStatus: async () => ({
-    configExists: true,
-    appRunning: true,
-    waitingForRecording: false,
-    waitingForDevice: false,
-    switching: false,
-    currentDevice: defaultRemoteAutomation.localAudioDevice,
-    lastError: ''
-  }),
   openSettings: () => {
     window.location.href = `${window.location.origin}${window.location.pathname}?mode=settings`;
   },
@@ -178,8 +159,7 @@ const api = window.vibeShortcut || {
   },
   chooseImage: async () => null,
   onConfigChanged: () => () => {},
-  onStartupChanged: () => () => {},
-  onShandianshuoStatusChanged: () => () => {}
+  onStartupChanged: () => () => {}
 };
 
 const mode = new URLSearchParams(window.location.search).get('mode') || 'floating';
@@ -649,8 +629,6 @@ function SettingsApp() {
   const [iconPicker, setIconPicker] = useState(null);
   const [iconSearch, setIconSearch] = useState('');
   const [startup, setStartup] = useState({ enabled: false, supported: false });
-  const [audioDevices, setAudioDevices] = useState([]);
-  const [shandianshuoStatus, setShandianshuoStatus] = useState(null);
   const recorderRef = useRef(null);
   const modifierRecordTimerRef = useRef(null);
   const draftReadyRef = useRef(false);
@@ -668,25 +646,6 @@ function SettingsApp() {
       if (mounted) setStartup(nextStartup);
     });
     const unsubscribe = api.onStartupChanged((nextStartup) => setStartup(nextStartup));
-    return () => {
-      mounted = false;
-      unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    let mounted = true;
-    api.listShandianshuoAudioDevices().then((result) => {
-      if (mounted) setAudioDevices(Array.isArray(result?.devices) ? result.devices : []);
-    }).catch((error) => {
-      console.error('Failed to list Shandianshuo audio devices', error);
-    });
-    api.getShandianshuoStatus().then((status) => {
-      if (mounted) setShandianshuoStatus(status);
-    }).catch((error) => {
-      console.error('Failed to read Shandianshuo status', error);
-    });
-    const unsubscribe = api.onShandianshuoStatusChanged((status) => setShandianshuoStatus(status));
     return () => {
       mounted = false;
       unsubscribe();
@@ -754,8 +713,6 @@ function SettingsApp() {
   const displayPresets = getEditableDisplayPresets(draft);
   const virtualDisplay = getVirtualDisplay(draft);
   const remoteAutomation = getRemoteAutomation(draft);
-  const audioDeviceOptions = getAudioDeviceOptions(audioDevices, remoteAutomation);
-  const shandianshuoStatusText = formatShandianshuoStatus(shandianshuoStatus);
 
   function commitDraft(updater, options) {
     setDraft((current) => {
@@ -1388,57 +1345,7 @@ function SettingsApp() {
         </div>
 
         <div className="form-section remote-automation-section">
-          <div className="virtual-display-target">
-            <span className="virtual-display-icon"><Icons.Mic size={18} /></span>
-            <span>
-              <strong>闪电说麦克风</strong>
-              <small>{shandianshuoStatusText}</small>
-            </span>
-          </div>
           <label className="switch-field">
-            <span>
-              <strong>自动切换麦克风</strong>
-              <small>连接 UU 使用虚拟麦克风，断开后切回本地设备</small>
-            </span>
-            <input
-              type="checkbox"
-              checked={remoteAutomation.microphoneEnabled}
-              onChange={(event) => setRemoteAutomationPatch({ microphoneEnabled: event.target.checked })}
-            />
-          </label>
-
-          <div className={`remote-audio-fields ${remoteAutomation.microphoneEnabled ? '' : 'is-disabled'}`}>
-            <label className="field">
-              <span>本地麦克风</span>
-              <select
-                value={remoteAutomation.localAudioDevice}
-                disabled={!remoteAutomation.microphoneEnabled}
-                onChange={(event) => setRemoteAutomationPatch({ localAudioDevice: event.target.value })}
-              >
-                {audioDeviceOptions.map((device) => (
-                  <option key={`local-${device.id}`} value={device.id}>
-                    {device.label}{!device.active && !device.system ? '（当前不可用）' : ''}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              <span>远程麦克风</span>
-              <select
-                value={remoteAutomation.remoteAudioDevice}
-                disabled={!remoteAutomation.microphoneEnabled}
-                onChange={(event) => setRemoteAutomationPatch({ remoteAudioDevice: event.target.value })}
-              >
-                {audioDeviceOptions.map((device) => (
-                  <option key={`remote-${device.id}`} value={device.id}>
-                    {device.label}{!device.active && !device.system ? '（当前不可用）' : ''}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          <label className="switch-field remote-reset-switch">
             <span>
               <strong>恢复悬浮窗默认位置</strong>
               <small>UU 连接或断开后回到外观中设置的角落</small>
@@ -1740,37 +1647,8 @@ function getRemoteAutomation(config) {
     ? config.remoteAutomation
     : defaultRemoteAutomation;
   return {
-    microphoneEnabled: source.microphoneEnabled !== false,
-    localAudioDevice: source.localAudioDevice || defaultRemoteAutomation.localAudioDevice,
-    remoteAudioDevice: source.remoteAudioDevice || defaultRemoteAutomation.remoteAudioDevice,
     resetFloatingWindow: source.resetFloatingWindow !== false
   };
-}
-
-function getAudioDeviceOptions(devices, remoteAutomation) {
-  const options = Array.isArray(devices) ? [...devices] : [];
-  const knownIds = new Set(options.map((device) => device.id));
-  if (!knownIds.has('system')) {
-    options.unshift({ id: 'system', label: '自动选择', active: true, system: true });
-    knownIds.add('system');
-  }
-  for (const deviceId of [remoteAutomation.localAudioDevice, remoteAutomation.remoteAudioDevice]) {
-    if (!knownIds.has(deviceId)) {
-      options.push({ id: deviceId, label: deviceId, active: false, system: false });
-      knownIds.add(deviceId);
-    }
-  }
-  return options;
-}
-
-function formatShandianshuoStatus(status) {
-  if (!status) return '正在读取闪电说状态';
-  if (status.waitingForRecording) return '正在录音，结束后自动切换';
-  if (status.waitingForDevice) return '正在等待目标麦克风就绪';
-  if (status.switching) return '正在切换麦克风';
-  if (!status.configExists) return '未找到闪电说配置';
-  if (status.lastError) return status.lastError;
-  return status.appRunning ? '闪电说正在运行' : '闪电说未运行，配置将在下次启动时生效';
 }
 
 function moveById(items, id, direction) {
