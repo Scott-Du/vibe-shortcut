@@ -6,25 +6,86 @@ import './styles.css';
 const LONG_PRESS_MS = 380;
 const DELETE_TO_CURSOR_HEAD_HOLD_MS = 2000;
 const MODIFIER_ONLY_COMMIT_MS = 700;
-const DELETE_TO_CURSOR_HEAD_SEQUENCE = ['Ctrl+Shift+Home', 'Backspace'];
+const DELETE_TO_HEAD_SEQUENCE = ['Ctrl+Shift+Home', 'Backspace'];
 const VOICE_MODE_ORDER = ['wechat', 'lightning'];
+const DeleteToHeadIcon = Icons.ArrowLeftToLine || Icons.CornerUpLeft || Icons.Delete;
 const PUNCTUATION_TOOL_ITEMS = [
   { id: 'copy', label: '复制', icon: 'Copy', shortcut: 'Ctrl+C' },
-  { id: 'paste', label: '粘贴', icon: 'ClipboardPaste', shortcut: 'Ctrl+V' },
+  { id: 'paste', label: '粘贴', icon: 'Clipboard', shortcut: 'Ctrl+V' },
   { id: 'cut', label: '剪切', icon: 'Scissors', shortcut: 'Ctrl+X' }
 ];
-const TabletModeIcon = Icons.TabletSmartphone || Icons.Tablet || Icons.MonitorSmartphone || Icons.PanelTop;
-const defaultTabletPreset = {
-  width: 0,
-  height: 0,
-  scale: 175,
-  orientation: 'portrait'
+const defaultPunctuationTools = {
+  screenshot: {
+    id: 'screenshot',
+    label: '截图',
+    icon: 'ScanLine',
+    shortcut: 'Ctrl+Q'
+  }
 };
 const defaultPunctuationItems = [
   { id: 'comma', label: '逗号', text: '，' },
   { id: 'period', label: '句号', text: '。' },
   { id: 'exclamation', label: '感叹号', text: '！' },
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
+];
+const defaultDisplayPresets = [
+  { id: 'preset-1', label: '设置一', orientation: 'portrait', target: 'gameviewer-virtual' },
+  { id: 'preset-2', label: '设置二', orientation: 'landscape', target: 'gameviewer-virtual' }
+];
+const defaultVirtualDisplay = {
+  adapterName: 'GameViewer Virtual Display Adapter',
+  lastOrientation: 'portrait',
+  lastPresetId: 'preset-1'
+};
+const defaultRemoteAutomation = {
+  refreshVirtualDisplayScale: true,
+  resetFloatingWindow: true
+};
+const SETTINGS_SECTIONS = [
+  { id: 'buttons', label: '按钮' },
+  { id: 'voice', label: '语音' },
+  { id: 'punctuation', label: '标点' },
+  { id: 'appearance', label: '外观' },
+  { id: 'display', label: '屏幕' },
+  { id: 'system', label: '系统' }
+];
+const ICON_PICKER_ITEMS = [
+  { icon: 'Mic', label: '话筒' },
+  { icon: 'SendHorizontal', label: '发送' },
+  { icon: 'Delete', label: '删除' },
+  { icon: 'Braces', label: '标点' },
+  { icon: 'Keyboard', label: '键盘' },
+  { icon: 'MessageCircle', label: '消息' },
+  { icon: 'Zap', label: '闪电' },
+  { icon: 'Clipboard', label: '粘贴' },
+  { icon: 'Copy', label: '复制' },
+  { icon: 'Scissors', label: '剪切' },
+  { icon: 'MousePointerClick', label: '点击' },
+  { icon: 'Settings', label: '设置' },
+  { icon: 'Monitor', label: '屏幕' },
+  { icon: 'TabletSmartphone', label: '平板' },
+  { icon: 'Command', label: '命令' },
+  { icon: 'CornerDownLeft', label: '回车' },
+  { icon: 'CornerUpLeft', label: '撤回' },
+  { icon: 'Trash2', label: '清理' },
+  { icon: 'Search', label: '搜索' },
+  { icon: 'Plus', label: '增加' },
+  { icon: 'Minus', label: '减少' },
+  { icon: 'Home', label: '主页' },
+  { icon: 'User', label: '用户' },
+  { icon: 'PenLine', label: '编辑' },
+  { icon: 'FileText', label: '文档' },
+  { icon: 'Image', label: '图片' },
+  { icon: 'Camera', label: '相机' },
+  { icon: 'Volume2', label: '音量' },
+  { icon: 'Headphones', label: '耳机' },
+  { icon: 'Bot', label: '智能' },
+  { icon: 'Sparkles', label: '灵感' },
+  { icon: 'Star', label: '星标' },
+  { icon: 'Heart', label: '喜欢' },
+  { icon: 'Bell', label: '提醒' },
+  { icon: 'Circle', label: '圆形' },
+  { icon: 'Square', label: '方形' }
 ];
 
 const defaultVoiceModes = {
@@ -50,7 +111,7 @@ const defaultVoiceModes = {
 };
 
 const previewConfig = {
-  schemaVersion: 5,
+  schemaVersion: 11,
   buttons: [
     { id: 'punctuation', label: '标点', iconType: 'lucide', icon: 'Braces', image: '', shortcut: '' },
     { id: 'voice', label: '语音', iconType: 'lucide', icon: 'Mic', image: '', shortcut: 'Ctrl+I' },
@@ -58,7 +119,10 @@ const previewConfig = {
     { id: 'delete', label: '删除', iconType: 'lucide', icon: 'Delete', image: '', shortcut: 'Backspace' }
   ],
   punctuationItems: defaultPunctuationItems,
-  tabletPreset: defaultTabletPreset,
+  punctuationTools: defaultPunctuationTools,
+  displayPresets: defaultDisplayPresets,
+  virtualDisplay: defaultVirtualDisplay,
+  remoteAutomation: defaultRemoteAutomation,
   voiceModes: defaultVoiceModes,
   window: { corner: 'bottom-right', buttonSize: 64, gap: 10, opacity: 0.78 }
 };
@@ -80,19 +144,20 @@ const api = window.vibeShortcut || {
     console.info(`Preview shortcut sequence: ${shortcuts.join(', ')}`);
     return { ok: true };
   },
-  sendText: async (text) => {
-    console.info(`Preview text: ${text}`);
+  sendText: async (text, afterShortcut) => {
+    console.info(`Preview text: ${text}${afterShortcut ? ` then ${afterShortcut}` : ''}`);
     return { ok: true };
   },
-  applyTabletPreset: async (preset) => {
-    console.info('Preview tablet preset:', preset);
+  insertText: async (text, afterShortcut) => {
+    console.info(`Preview text insert: ${text}${afterShortcut ? ` then ${afterShortcut}` : ''}`);
     return { ok: true };
   },
+  startRepeatShortcut: async (shortcut) => {
+    console.info(`Preview repeat shortcut: ${shortcut}`);
+    return { ok: true };
+  },
+  stopRepeatShortcut: async () => ({ ok: true }),
   setSideActionsOpen: async () => ({ ok: true }),
-  resetFloatingPosition: async () => ({ ok: true }),
-  moveFloatingDrag: async () => ({ ok: true }),
-  endFloatingDrag: async () => ({ ok: true }),
-  closeTrayMenu: async () => ({ ok: true }),
   getStartup: async () => ({ enabled: false, supported: false }),
   setStartup: async () => ({ enabled: false, supported: false }),
   openSettings: () => {
@@ -109,42 +174,40 @@ const api = window.vibeShortcut || {
 const mode = new URLSearchParams(window.location.search).get('mode') || 'floating';
 
 function App() {
-  if (mode === 'settings') return <SettingsApp />;
-  if (mode === 'tray') return <TrayQuickMenu />;
-  return <FloatingPanel />;
+  return mode === 'settings' ? <SettingsApp /> : <FloatingPanel />;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function waitForPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+  });
 }
 
 function FloatingPanel() {
   const [config, setConfig] = useConfig();
   const [activeId, setActiveId] = useState(null);
   const [sideActionType, setSideActionTypeState] = useState(null);
-  const pressRef = useRef(null);
-  const longPressTimerRef = useRef(null);
-  const pointerCleanupRef = useRef(null);
-  const sideActionTypeRef = useRef(null);
-  const sideActionCloseTimerRef = useRef(null);
-  const deleteRepeatTimerRef = useRef(null);
+  const [deleteHeadArmed, setDeleteHeadArmed] = useState(false);
+  const repeatDelayRef = useRef(null);
+  const repeatingRef = useRef(false);
+  const longPressTriggeredRef = useRef(false);
+  const pressedButtonRef = useRef(null);
+  const deleteHeadRef = useRef(null);
   const deleteToHeadTimerRef = useRef(null);
+  const deleteToHeadTriggeredRef = useRef(false);
+  const deleteRepeatTimerRef = useRef(null);
   const deleteRepeatActiveRef = useRef(false);
   const deleteRepeatInFlightRef = useRef(null);
-  const shellPressRef = useRef(null);
-  const shellDragFrameRef = useRef(null);
-  const shellDragPayloadRef = useRef(null);
+  const sideActionRequestRef = useRef(0);
 
   useEffect(() => {
-    const handleSafetyStop = () => {
-      resetInteraction({ closeSideActions: true });
-    };
-
-    window.addEventListener('blur', handleSafetyStop);
-    window.addEventListener('pagehide', handleSafetyStop);
-    document.addEventListener('visibilitychange', handleSafetyStop);
-
     return () => {
-      window.removeEventListener('blur', handleSafetyStop);
-      window.removeEventListener('pagehide', handleSafetyStop);
-      document.removeEventListener('visibilitychange', handleSafetyStop);
-      resetInteraction({ closeSideActions: true });
+      sideActionRequestRef.current += 1;
+      stopRepeat();
       api.setSideActionsOpen(false);
     };
   }, []);
@@ -163,10 +226,36 @@ function FloatingPanel() {
   };
 
   function setSideActionType(type) {
-    clearSideActionCloseTimer();
-    sideActionTypeRef.current = type;
-    setSideActionTypeState(type);
-    api.setSideActionsOpen(Boolean(type));
+    const nextType = type || null;
+    const requestId = sideActionRequestRef.current + 1;
+    sideActionRequestRef.current = requestId;
+    setDeleteHeadArmed(false);
+
+    if (nextType) {
+      return api.setSideActionsOpen(true).finally(() => {
+        if (sideActionRequestRef.current !== requestId) return;
+        window.requestAnimationFrame(() => {
+          if (sideActionRequestRef.current === requestId) {
+            setSideActionTypeState(nextType);
+          }
+        });
+      });
+      return;
+    }
+
+    setSideActionTypeState(null);
+    return new Promise((resolve) => {
+      window.requestAnimationFrame(() => {
+        if (sideActionRequestRef.current !== requestId) {
+          resolve();
+          return;
+        }
+
+        Promise.resolve(api.setSideActionsOpen(false))
+          .catch(() => {})
+          .finally(resolve);
+      });
+    });
   }
 
   function pulse(id) {
@@ -174,198 +263,219 @@ function FloatingPanel() {
     window.setTimeout(() => setActiveId(null), 160);
   }
 
-  async function triggerShortcut(id, shortcut) {
+  async function triggerShortcut(id, shortcut, context) {
     pulse(id);
-    await api.sendShortcut(shortcut);
+    await api.sendShortcut(shortcut, context);
   }
 
   async function triggerButton(button) {
     if (isVoiceButton(button)) {
       const activeMode = getActiveVoiceMode(config);
-      await triggerShortcut(`voice:${activeMode.id}`, activeMode.shortcut);
+      await triggerShortcut(`voice:${activeMode.id}`, activeMode.shortcut, {
+        kind: 'voice',
+        modeId: activeMode.id,
+        label: activeMode.label
+      });
       return;
     }
 
     if (isPunctuationButton(button)) {
       pulse(button.id);
-      setSideActionType(sideActionTypeRef.current === 'punctuation' ? null : 'punctuation');
+      setSideActionType(sideActionType === 'punctuation' ? null : 'punctuation');
       return;
     }
 
     await triggerShortcut(button.id, button.shortcut);
   }
 
-  async function triggerDeleteToCursorHead() {
+  async function triggerDeleteToHead() {
     pulse('delete-head');
-    await api.sendShortcutSequence(DELETE_TO_CURSOR_HEAD_SEQUENCE);
+    await api.sendShortcutSequence(DELETE_TO_HEAD_SEQUENCE);
   }
 
-  async function insertPunctuation(item) {
-    pulse('punctuation');
-    await api.sendText(item.text, item.afterShortcut);
-    setSideActionType(null);
+  async function triggerPunctuationItem(item) {
+    pulse(`punctuation:${item.id}`);
+    if (api.sendText) await api.sendText(item.text, item.afterShortcut);
+    else await api.insertText(item.text, item.afterShortcut);
   }
 
-  async function runPunctuationTool(tool) {
+  async function triggerPunctuationTool(tool) {
     pulse(`punctuation:${tool.id}`);
+
+    if (tool.id === 'screenshot') {
+      await setSideActionType(null);
+      await waitForPaint();
+      await sleep(40);
+    }
+
     await api.sendShortcut(tool.shortcut);
+  }
+
+  function openVoiceSelector(button, options = {}) {
+    longPressTriggeredRef.current = true;
+    if (options.pulseButton !== false) pulse(button.id);
+    setSideActionType('voice');
+  }
+
+  async function handleButtonContextMenu(event, button) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (repeatDelayRef.current) {
+      window.clearTimeout(repeatDelayRef.current);
+      repeatDelayRef.current = null;
+    }
+    if (repeatingRef.current) {
+      repeatingRef.current = false;
+      api.stopRepeatShortcut();
+    }
+
+    longPressTriggeredRef.current = false;
+    pressedButtonRef.current = null;
+
+    if (isVoiceButton(button)) {
+      if (sideActionType === 'voice') {
+        setSideActionType(null);
+      } else {
+        openVoiceSelector(button, { pulseButton: false });
+      }
+      return;
+    }
+
+    if (isPunctuationButton(button)) {
+      setSideActionType(sideActionType === 'punctuation' ? null : 'punctuation');
+      return;
+    }
+
+    if (isSendButton(button)) {
+      pulse(button.id);
+      await api.sendShortcut('Ctrl+Enter');
+      return;
+    }
+
+    if (isRepeatDeleteButton(button)) {
+      setSideActionType(null);
+      await triggerDeleteToHead();
+      return;
+    }
+
     setSideActionType(null);
-  }
-
-  function isInsideButton(target) {
-    return Boolean(target && typeof target.closest === 'function' && target.closest('button'));
-  }
-
-  function startShellInteraction(event) {
-    if (event.button !== 0 || isInsideButton(event.target)) return;
-    if (event.detail > 1) return;
-
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    shellPressRef.current = {
-      pointerId: event.pointerId,
-      startX: event.screenX,
-      startY: event.screenY,
-      dragStarted: false
-    };
-  }
-
-  function moveShellInteraction(event) {
-    const press = shellPressRef.current;
-    if (!press || press.pointerId !== event.pointerId) return;
-
-    const distance = Math.hypot(event.screenX - press.startX, event.screenY - press.startY);
-    if (!press.dragStarted && distance < 4) return;
-
-    press.dragStarted = true;
-    event.preventDefault();
-    event.stopPropagation();
-    scheduleShellDragMove(press, event);
-  }
-
-  function endShellInteraction(event) {
-    const press = shellPressRef.current;
-    if (!press || press.pointerId !== event.pointerId) return;
-    shellPressRef.current = null;
-    if (press.dragStarted) {
-      flushShellDragMove();
-      Promise.resolve(api.endFloatingDrag()).catch(() => null);
-    }
-  }
-
-  function scheduleShellDragMove(press, event) {
-    shellDragPayloadRef.current = {
-      startX: press.startX,
-      startY: press.startY,
-      currentX: event.screenX,
-      currentY: event.screenY
-    };
-
-    if (shellDragFrameRef.current) return;
-    shellDragFrameRef.current = window.requestAnimationFrame(() => {
-      shellDragFrameRef.current = null;
-      flushShellDragMove();
-    });
-  }
-
-  function flushShellDragMove() {
-    const payload = shellDragPayloadRef.current;
-    shellDragPayloadRef.current = null;
-    if (!payload) return;
-    Promise.resolve(api.moveFloatingDrag(payload)).catch(() => null);
-  }
-
-  function clearShellDragState() {
-    shellPressRef.current = null;
-    shellDragPayloadRef.current = null;
-    if (shellDragFrameRef.current) {
-      window.cancelAnimationFrame(shellDragFrameRef.current);
-      shellDragFrameRef.current = null;
-    }
-    Promise.resolve(api.endFloatingDrag()).catch(() => null);
-  }
-
-  async function resetFloatingPosition(event) {
-    if (isInsideButton(event.target)) return;
-
-    event.preventDefault();
-    event.stopPropagation();
-    resetInteraction({ closeSideActions: true });
-    await api.resetFloatingPosition();
   }
 
   function startPress(event, button) {
     if (event.button === 2) return;
     event.preventDefault();
-    const keepPunctuationOpen = isPunctuationButton(button) && sideActionTypeRef.current === 'punctuation';
-    resetInteraction({ closeSideActions: !keepPunctuationOpen });
     event.currentTarget.setPointerCapture?.(event.pointerId);
+    longPressTriggeredRef.current = false;
+    pressedButtonRef.current = button;
+    deleteToHeadTriggeredRef.current = false;
 
-    const press = {
-      button,
-      pointerId: event.pointerId,
-      startScreen: { x: event.screenX, y: event.screenY },
-      longPress: false,
-      longActionFired: false,
-      deleteToHeadTriggered: false
-    };
-    pressRef.current = press;
-    attachPressListeners(press.pointerId);
+    if (sideActionType) setSideActionType(null);
 
-    longPressTimerRef.current = window.setTimeout(() => {
-      handleLongPress(press);
-    }, LONG_PRESS_MS);
+    if (isVoiceButton(button)) {
+      repeatDelayRef.current = window.setTimeout(() => {
+        openVoiceSelector(button);
+      }, LONG_PRESS_MS);
+      return;
+    }
 
     if (isRepeatDeleteButton(button)) {
+      repeatDelayRef.current = window.setTimeout(() => {
+        longPressTriggeredRef.current = true;
+        startDeleteRepeat();
+      }, LONG_PRESS_MS);
       deleteToHeadTimerRef.current = window.setTimeout(() => {
-        runHeldDeleteToCursorHead(press);
+        runHeldDeleteToHead(button);
       }, DELETE_TO_CURSOR_HEAD_HOLD_MS);
-    }
-  }
-
-  function handleLongPress(press) {
-    if (pressRef.current !== press) return;
-    press.longPress = true;
-
-    if (isVoiceButton(press.button)) {
-      setSideActionType('voice');
       return;
     }
 
-    if (isPunctuationButton(press.button)) {
-      setSideActionType('punctuation');
+    if (isSendButton(button)) {
+      repeatDelayRef.current = window.setTimeout(() => {
+        longPressTriggeredRef.current = true;
+        pulse(button.id);
+        api.sendShortcut('Ctrl+Enter');
+      }, LONG_PRESS_MS);
       return;
     }
 
-    if (isRepeatDeleteButton(press.button)) {
-      enterDeleteRepeating();
-      return;
-    }
-
-    if (isSendButton(press.button)) {
-      press.longActionFired = true;
-      pulse(press.button.id);
-      api.sendShortcut('Ctrl+Enter');
-    }
+    triggerButton(button);
   }
 
-  function enterDeleteRepeating() {
-    startDeleteRepeat();
+  function movePress(event) {
+    if (!pressedButtonRef.current || sideActionType !== 'delete') return;
+    setDeleteHeadArmed(isPointerInside(event, deleteHeadRef.current));
   }
 
-  async function runHeldDeleteToCursorHead(press) {
-    if (pressRef.current !== press || press.deleteToHeadTriggered) return;
+  async function stopPress(event, finalize = true) {
+    const pressedButton = pressedButtonRef.current;
+    const wasLongPress = longPressTriggeredRef.current;
+    const deleteToHeadTriggered = deleteToHeadTriggeredRef.current;
+    const shouldDeleteToHead =
+      finalize &&
+      pressedButton &&
+      isRepeatDeleteButton(pressedButton) &&
+      wasLongPress &&
+      isPointerInside(event, deleteHeadRef.current);
 
-    press.deleteToHeadTriggered = true;
+    if (repeatDelayRef.current) {
+      window.clearTimeout(repeatDelayRef.current);
+      repeatDelayRef.current = null;
+    }
     clearDeleteToHeadTimer();
-    clearLongPressTimer();
-    setSideActionType(null);
-    await stopDeleteRepeat({ waitForInFlight: true });
-    await triggerDeleteToCursorHead();
+    if (pressedButton && isRepeatDeleteButton(pressedButton)) {
+      await stopDeleteRepeat({ waitForInFlight: true });
+    }
+
+    longPressTriggeredRef.current = false;
+    pressedButtonRef.current = null;
+    deleteToHeadTriggeredRef.current = false;
+
+    if (pressedButton && isRepeatDeleteButton(pressedButton)) {
+      setSideActionType(null);
+      if (shouldDeleteToHead && !deleteToHeadTriggered) {
+        await triggerDeleteToHead();
+      } else if (finalize && !wasLongPress && !deleteToHeadTriggered) {
+        await triggerShortcut(pressedButton.id, pressedButton.shortcut || 'Backspace');
+      }
+      return;
+    }
+
+    if (finalize && pressedButton && isVoiceButton(pressedButton) && !wasLongPress) {
+      triggerButton(pressedButton);
+      return;
+    }
+
+    if (finalize && pressedButton && isSendButton(pressedButton) && !wasLongPress) {
+      triggerButton(pressedButton);
+    }
+  }
+
+  function stopRepeat() {
+    if (repeatDelayRef.current) {
+      window.clearTimeout(repeatDelayRef.current);
+      repeatDelayRef.current = null;
+    }
+    clearDeleteToHeadTimer();
+    repeatingRef.current = false;
+    longPressTriggeredRef.current = false;
+    pressedButtonRef.current = null;
+    deleteToHeadTriggeredRef.current = false;
+    setDeleteHeadArmed(false);
+    api.stopRepeatShortcut();
+    stopDeleteRepeat();
+  }
+
+  function clearDeleteToHeadTimer() {
+    if (deleteToHeadTimerRef.current) {
+      window.clearTimeout(deleteToHeadTimerRef.current);
+      deleteToHeadTimerRef.current = null;
+    }
   }
 
   function startDeleteRepeat() {
     stopDeleteRepeat();
+    repeatingRef.current = true;
     deleteRepeatActiveRef.current = true;
 
     const tick = () => {
@@ -382,6 +492,7 @@ function FloatingPanel() {
   }
 
   async function stopDeleteRepeat(options = {}) {
+    repeatingRef.current = false;
     deleteRepeatActiveRef.current = false;
     if (deleteRepeatTimerRef.current) {
       window.clearInterval(deleteRepeatTimerRef.current);
@@ -394,141 +505,19 @@ function FloatingPanel() {
     }
   }
 
-  async function finishPress(options = {}) {
-    const { finalize = true, closeSideActions = false } = options;
-    const press = pressRef.current;
+  async function runHeldDeleteToHead(button) {
+    if (pressedButtonRef.current !== button || deleteToHeadTriggeredRef.current) return;
 
-    clearLongPressTimer();
+    deleteToHeadTriggeredRef.current = true;
+    longPressTriggeredRef.current = true;
     clearDeleteToHeadTimer();
-    detachPressListeners();
-    pressRef.current = null;
+    if (repeatDelayRef.current) {
+      window.clearTimeout(repeatDelayRef.current);
+      repeatDelayRef.current = null;
+    }
+    setSideActionType(null);
     await stopDeleteRepeat({ waitForInFlight: true });
-
-    if (!press) {
-      if (closeSideActions) setSideActionType(null);
-      return;
-    }
-
-    if (!finalize) {
-      if (closeSideActions || !press.longPress || isRepeatDeleteButton(press.button)) setSideActionType(null);
-      return;
-    }
-
-    if (!press.longPress) {
-      if (isPunctuationButton(press.button)) {
-        await triggerButton(press.button);
-        return;
-      }
-      setSideActionType(null);
-      if (isRepeatDeleteButton(press.button)) {
-        await triggerShortcut(press.button.id, press.button.shortcut || 'Backspace');
-        return;
-      }
-      await triggerButton(press.button);
-      return;
-    }
-
-    if (isRepeatDeleteButton(press.button)) {
-      setSideActionType(null);
-      return;
-    }
-
-    if (!press.longActionFired && !isVoiceButton(press.button) && !isPunctuationButton(press.button)) {
-      setSideActionType(null);
-    }
-  }
-
-  function resetInteraction(options = {}) {
-    clearLongPressTimer();
-    clearDeleteToHeadTimer();
-    detachPressListeners();
-    stopDeleteRepeat();
-    clearSideActionCloseTimer();
-    pressRef.current = null;
-    clearShellDragState();
-    if (options.closeSideActions) setSideActionType(null);
-  }
-
-  function clearLongPressTimer() {
-    if (longPressTimerRef.current) {
-      window.clearTimeout(longPressTimerRef.current);
-      longPressTimerRef.current = null;
-    }
-  }
-
-  function clearDeleteToHeadTimer() {
-    if (deleteToHeadTimerRef.current) {
-      window.clearTimeout(deleteToHeadTimerRef.current);
-      deleteToHeadTimerRef.current = null;
-    }
-  }
-
-  function attachPressListeners(pointerId) {
-    detachPressListeners();
-
-    const matchesPointer = (event) => event.pointerId === pointerId;
-    const onPointerMove = (event) => {
-      if (!matchesPointer(event)) return;
-    };
-    const onPointerUp = (event) => {
-      if (matchesPointer(event)) finishPress({ finalize: true });
-    };
-    const onPointerCancel = (event) => {
-      if (matchesPointer(event)) finishPress({ finalize: false, closeSideActions: true });
-    };
-
-    window.addEventListener('pointermove', onPointerMove, true);
-    window.addEventListener('pointerup', onPointerUp, true);
-    window.addEventListener('pointercancel', onPointerCancel, true);
-    pointerCleanupRef.current = () => {
-      window.removeEventListener('pointermove', onPointerMove, true);
-      window.removeEventListener('pointerup', onPointerUp, true);
-      window.removeEventListener('pointercancel', onPointerCancel, true);
-    };
-  }
-
-  function detachPressListeners() {
-    if (pointerCleanupRef.current) {
-      pointerCleanupRef.current();
-      pointerCleanupRef.current = null;
-    }
-  }
-
-  function scheduleSideActionClose() {
-    clearSideActionCloseTimer();
-    sideActionCloseTimerRef.current = window.setTimeout(() => {
-      sideActionCloseTimerRef.current = null;
-      if (!pressRef.current) setSideActionType(null);
-    }, 1600);
-  }
-
-  function clearSideActionCloseTimer() {
-    if (sideActionCloseTimerRef.current) {
-      window.clearTimeout(sideActionCloseTimerRef.current);
-      sideActionCloseTimerRef.current = null;
-    }
-  }
-
-  async function handleButtonContextMenu(event, button) {
-    event.preventDefault();
-    event.stopPropagation();
-    resetInteraction({ closeSideActions: true });
-
-    if (isVoiceButton(button)) {
-      setSideActionType('voice');
-      return;
-    }
-
-    if (isPunctuationButton(button)) {
-      setSideActionType('punctuation');
-      return;
-    }
-
-    if (isSendButton(button)) {
-      pulse(button.id);
-      await api.sendShortcut('Ctrl+Enter');
-      return;
-    }
+    await triggerDeleteToHead();
   }
 
   async function selectVoiceMode(modeId) {
@@ -539,7 +528,7 @@ function FloatingPanel() {
         activeId: modeId
       }
     };
-    const saved = await api.saveConfig(nextConfig);
+    const saved = await api.saveConfig(nextConfig, { preserveFloatingBounds: true });
     setConfig(saved);
     setSideActionType(null);
   }
@@ -547,7 +536,7 @@ function FloatingPanel() {
   function renderSideActions() {
     if (!sideActionType) return null;
 
-    const targetId = sideActionType === 'voice' ? 'voice' : 'punctuation';
+    const targetId = sideActionType === 'voice' ? 'voice' : sideActionType === 'punctuation' ? 'punctuation' : 'delete';
     const rowIndex = Math.max(buttons.findIndex((button) => button.id === targetId), 0);
     const top = 12 + rowIndex * (buttonSize + config.window.gap) + buttonSize / 2;
 
@@ -577,7 +566,7 @@ function FloatingPanel() {
       return (
         <div className="side-action-column punctuation-panel" onPointerDown={(event) => event.stopPropagation()}>
           <div className="punctuation-tool-column">
-            {PUNCTUATION_TOOL_ITEMS.map((tool) => {
+            {getPunctuationToolItems(config).map((tool) => {
               const ToolIcon = Icons[tool.icon] || Icons.Circle;
               return (
                 <button
@@ -586,7 +575,7 @@ function FloatingPanel() {
                   className="side-action-button punctuation-action punctuation-tool-action"
                   title={tool.label}
                   aria-label={tool.label}
-                  onClick={() => runPunctuationTool(tool)}
+                  onClick={() => triggerPunctuationTool(tool)}
                 >
                   <ToolIcon size={Math.round(sideButtonSize * 0.38)} strokeWidth={2.4} />
                 </button>
@@ -600,7 +589,7 @@ function FloatingPanel() {
                 type="button"
                 className="side-action-button punctuation-action"
                 title={item.label}
-                onClick={() => insertPunctuation(item)}
+                onClick={() => triggerPunctuationItem(item)}
               >
                 <span className="punctuation-glyph">{item.text}</span>
               </button>
@@ -610,7 +599,18 @@ function FloatingPanel() {
       );
     }
 
-    return null;
+    return (
+      <div className="side-action-row" style={{ top: `${top}px` }}>
+        <button
+          ref={deleteHeadRef}
+          type="button"
+          className={`side-action-button danger-action ${deleteHeadArmed ? 'is-armed' : ''}`}
+          title="删到光标前"
+        >
+          <DeleteToHeadIcon size={Math.round(sideButtonSize * 0.45)} strokeWidth={2.4} />
+        </button>
+      </div>
+    );
   }
 
   return (
@@ -625,15 +625,7 @@ function FloatingPanel() {
     >
       <div className="floating-layout" style={style}>
         {renderSideActions()}
-        <section
-          className="floating-shell"
-          onPointerDown={startShellInteraction}
-          onPointerMove={moveShellInteraction}
-          onPointerUp={endShellInteraction}
-          onPointerCancel={endShellInteraction}
-          onLostPointerCapture={endShellInteraction}
-          onDoubleClick={resetFloatingPosition}
-        >
+        <section className="floating-shell">
           <div className="shortcut-stack">
             {buttons.map((button) => (
               <button
@@ -642,6 +634,10 @@ function FloatingPanel() {
                 title={buttonTitle(button, config)}
                 type="button"
                 onPointerDown={(event) => startPress(event, button)}
+                onPointerMove={movePress}
+                onPointerUp={(event) => stopPress(event, true)}
+                onPointerCancel={(event) => stopPress(event, false)}
+                onLostPointerCapture={(event) => stopPress(event, false)}
                 onContextMenu={(event) => handleButtonContextMenu(event, button)}
               >
                 <ButtonIcon button={button} size={Math.round(buttonSize * 0.42)} />
@@ -654,44 +650,23 @@ function FloatingPanel() {
   );
 }
 
-function TrayQuickMenu() {
-  const [config] = useConfig();
-
-  if (!config) return null;
-
-  const tabletPreset = getTabletPreset(config);
-
-  async function applyTabletMode() {
-    await api.applyTabletPreset(tabletPreset);
-    await api.closeTrayMenu();
-  }
-
-  return (
-    <main className="tray-menu-stage" onContextMenu={(event) => event.preventDefault()}>
-      <section className="tray-menu-panel">
-        <button type="button" className="tray-menu-item" onClick={applyTabletMode}>
-          <TabletModeIcon size={17} />
-          <span>适配平板</span>
-        </button>
-
-      </section>
-    </main>
-  );
-}
-
 function SettingsApp() {
   const [config, setConfig] = useConfig();
   const [draft, setDraft] = useState(null);
-  const [selectedId, setSelectedId] = useState(null);
+  const [activeSection, setActiveSection] = useState('buttons');
   const [recordingId, setRecordingId] = useState(null);
+  const [iconPicker, setIconPicker] = useState(null);
+  const [iconSearch, setIconSearch] = useState('');
   const [startup, setStartup] = useState({ enabled: false, supported: false });
   const recorderRef = useRef(null);
   const modifierRecordTimerRef = useRef(null);
+  const draftReadyRef = useRef(false);
+  const saveRequestRef = useRef(0);
 
   useEffect(() => {
-    if (!config) return;
+    if (!config || draftReadyRef.current) return;
     setDraft(config);
-    setSelectedId((current) => current || config.buttons[0]?.id || null);
+    draftReadyRef.current = true;
   }, [config]);
 
   useEffect(() => {
@@ -723,6 +698,8 @@ function SettingsApp() {
         updateVoiceMode(recordingId.replace('voice:', ''), { shortcut });
       } else if (recordingId.startsWith('button:')) {
         updateButton(recordingId.replace('button:', ''), { shortcut });
+      } else if (recordingId === 'tool:screenshot') {
+        updateScreenshotTool({ shortcut });
       }
       setRecordingId(null);
     };
@@ -761,12 +738,32 @@ function SettingsApp() {
 
   if (!draft) return null;
 
-  const selectedButton = draft.buttons.find((button) => button.id === selectedId) || draft.buttons[0];
+  const buttons = Array.isArray(draft.buttons) ? draft.buttons : [];
   const voiceModes = getVoiceModes(draft);
-  const tabletPreset = getTabletPreset(draft);
+  const punctuationItems = getEditablePunctuationItems(draft);
+  const punctuationTools = getPunctuationTools(draft);
+  const displayPresets = getEditableDisplayPresets(draft);
+  const remoteAutomation = getRemoteAutomation(draft);
+
+  function commitDraft(updater, options) {
+    setDraft((current) => {
+      if (!current) return current;
+      const nextDraft = typeof updater === 'function' ? updater(current) : updater;
+      const requestId = saveRequestRef.current + 1;
+      saveRequestRef.current = requestId;
+      api.saveConfig(nextDraft, options).then((saved) => {
+        if (saveRequestRef.current !== requestId) return;
+        setConfig(saved);
+        setDraft(saved);
+      }).catch((error) => {
+        console.error('Failed to save config', error);
+      });
+      return nextDraft;
+    });
+  }
 
   function setWindowPatch(patch) {
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       window: {
         ...current.window,
@@ -775,30 +772,21 @@ function SettingsApp() {
     }));
   }
 
-  function setTabletPresetPatch(patch) {
-    setDraft((current) => ({
-      ...current,
-      tabletPreset: {
-        ...getTabletPreset(current),
-        ...patch
-      }
-    }));
-  }
-
   function updateButton(id, patch) {
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       buttons: current.buttons.map((button) => (button.id === id ? { ...button, ...patch } : button))
     }));
   }
 
   function updateVoiceMode(id, patch) {
-    setDraft((current) => {
+    commitDraft((current) => {
       const currentVoiceModes = getVoiceModes(current);
       return {
         ...current,
         voiceModes: {
           ...currentVoiceModes,
+          activeId: Object.prototype.hasOwnProperty.call(patch, 'shortcut') ? id : currentVoiceModes.activeId,
           options: {
             ...currentVoiceModes.options,
             [id]: {
@@ -812,7 +800,7 @@ function SettingsApp() {
   }
 
   function setActiveVoiceMode(id) {
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       voiceModes: {
         ...getVoiceModes(current),
@@ -827,40 +815,35 @@ function SettingsApp() {
       id,
       label: '新按钮',
       iconType: 'lucide',
-      icon: 'Sparkle',
+      icon: 'Sparkles',
       image: '',
       shortcut: 'Ctrl+I'
     };
-    setDraft((current) => ({
+    commitDraft((current) => ({
       ...current,
       buttons: [...current.buttons, nextButton]
     }));
-    setSelectedId(id);
   }
 
-  function removeSelectedButton() {
-    if (!selectedButton || draft.buttons.length <= 1) return;
-    const nextButtons = draft.buttons.filter((button) => button.id !== selectedButton.id);
-    setDraft((current) => ({ ...current, buttons: nextButtons }));
-    setSelectedId(nextButtons[0]?.id || null);
+  function removeButton(id) {
+    if (buttons.length <= 1) return;
+    commitDraft((current) => ({
+      ...current,
+      buttons: current.buttons.filter((button) => button.id !== id)
+    }));
   }
 
-  function moveSelectedButton(direction) {
-    if (!selectedButton) return;
-    const index = draft.buttons.findIndex((button) => button.id === selectedButton.id);
-    const nextIndex = index + direction;
-    if (nextIndex < 0 || nextIndex >= draft.buttons.length) return;
-    const nextButtons = [...draft.buttons];
-    const [item] = nextButtons.splice(index, 1);
-    nextButtons.splice(nextIndex, 0, item);
-    setDraft((current) => ({ ...current, buttons: nextButtons }));
+  function moveButton(id, direction) {
+    commitDraft((current) => ({
+      ...current,
+      buttons: moveById(current.buttons, id, direction)
+    }));
   }
 
-  async function chooseButtonImage() {
-    if (!selectedButton) return;
+  async function chooseButtonImage(id) {
     const image = await api.chooseImage();
     if (image) {
-      updateButton(selectedButton.id, { iconType: 'image', image });
+      updateButton(id, { iconType: 'image', image });
     }
   }
 
@@ -871,14 +854,668 @@ function SettingsApp() {
     }
   }
 
-  async function save() {
-    const saved = await api.saveConfig(draft);
-    setDraft(saved);
+  function addPunctuationItem() {
+    const id = `punctuation-${Date.now()}`;
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: [
+        ...getEditablePunctuationItems(current),
+        { id, label: '新标点', text: '', afterShortcut: '' }
+      ]
+    }));
+  }
+
+  function updatePunctuationItem(id, patch) {
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: getEditablePunctuationItems(current).map((item) => (
+        item.id === id ? { ...item, ...patch } : item
+      ))
+    }));
+  }
+
+  function updateScreenshotTool(patch) {
+    commitDraft((current) => ({
+      ...current,
+      punctuationTools: {
+        ...getPunctuationTools(current),
+        screenshot: {
+          ...getPunctuationTools(current).screenshot,
+          ...patch
+        }
+      }
+    }), { preserveFloatingBounds: true });
+  }
+
+  function removePunctuationItem(id) {
+    if (punctuationItems.length <= 1) return;
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: getEditablePunctuationItems(current).filter((item) => item.id !== id)
+    }));
+  }
+
+  function movePunctuationItem(id, direction) {
+    commitDraft((current) => ({
+      ...current,
+      punctuationItems: moveById(getEditablePunctuationItems(current), id, direction)
+    }));
+  }
+
+  function addDisplayPreset() {
+    const id = `preset-${Date.now()}`;
+    const index = displayPresets.length + 1;
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: [
+        ...getEditableDisplayPresets(current),
+        { id, label: `设置${index}`, orientation: 'landscape', target: 'gameviewer-virtual' }
+      ]
+    }));
+  }
+
+  function updateDisplayPreset(id, patch) {
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: getEditableDisplayPresets(current).map((preset) => (
+        preset.id === id ? { ...preset, ...patch } : preset
+      ))
+    }));
+  }
+
+  function setRemoteAutomationPatch(patch) {
+    commitDraft((current) => ({
+      ...current,
+      remoteAutomation: {
+        ...getRemoteAutomation(current),
+        ...patch
+      }
+    }), { preserveFloatingBounds: true });
+  }
+
+  function removeDisplayPreset(id) {
+    if (displayPresets.length <= 1) return;
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: getEditableDisplayPresets(current).filter((preset) => preset.id !== id)
+    }));
+  }
+
+  function moveDisplayPreset(id, direction) {
+    commitDraft((current) => ({
+      ...current,
+      displayPresets: moveById(getEditableDisplayPresets(current), id, direction)
+    }));
+  }
+
+  function restoreDefaults() {
+    commitDraft(previewConfig);
+  }
+
+  function openIconPicker(targetType, id, currentIcon) {
+    setIconSearch('');
+    setIconPicker({ targetType, id, currentIcon: currentIcon || 'Circle' });
+  }
+
+  function closeIconPicker() {
+    setIconPicker(null);
+  }
+
+  function chooseLucideIcon(iconName) {
+    if (!iconPicker) return;
+    if (iconPicker.targetType === 'voice') {
+      updateVoiceMode(iconPicker.id, { iconType: 'lucide', icon: iconName });
+    } else {
+      updateButton(iconPicker.id, { iconType: 'lucide', icon: iconName });
+    }
+    closeIconPicker();
+  }
+
+  function renderIconSelect(iconName, onClick) {
+    const label = iconLabel(iconName);
+    return (
+      <button type="button" className="icon-select-button" onClick={onClick}>
+        <span className="icon-select-preview">
+          <LucideIcon name={iconName} size={20} />
+        </span>
+        <span className="icon-select-copy">
+          <strong>{label}</strong>
+          <small>{iconName || 'Circle'}</small>
+        </span>
+        <Icons.ChevronDown size={16} />
+      </button>
+    );
+  }
+
+  function renderIconPicker() {
+    if (!iconPicker) return null;
+    const query = iconSearch.trim().toLowerCase();
+    const filteredIcons = ICON_PICKER_ITEMS.filter((item) => (
+      !query ||
+      item.icon.toLowerCase().includes(query) ||
+      item.label.toLowerCase().includes(query)
+    ));
+
+    return (
+      <div
+        className="icon-picker-backdrop"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) closeIconPicker();
+        }}
+      >
+        <div className="icon-picker" role="dialog" aria-label="选择图标">
+          <div className="icon-picker-header">
+            <strong>选择图标</strong>
+            <button type="button" onClick={closeIconPicker} title="关闭">
+              <Icons.X size={16} />
+            </button>
+          </div>
+          <label className="icon-picker-search">
+            <Icons.Search size={15} />
+            <input
+              value={iconSearch}
+              onChange={(event) => setIconSearch(event.target.value)}
+              placeholder="搜索图标"
+              autoFocus
+            />
+          </label>
+          <div className="icon-picker-grid">
+            {filteredIcons.map((item) => (
+              <button
+                key={item.icon}
+                type="button"
+                className={`icon-picker-item ${item.icon === iconPicker.currentIcon ? 'is-selected' : ''}`}
+                onClick={() => chooseLucideIcon(item.icon)}
+                title={`${item.label} · ${item.icon}`}
+              >
+                <LucideIcon name={item.icon} size={21} />
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   async function toggleStartup(event) {
     const nextStartup = await api.setStartup(event.target.checked);
     setStartup(nextStartup);
+  }
+
+  function renderButtonsSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>按钮</h2>
+            <p>悬浮框里的主按钮</p>
+          </div>
+          <button className="small-icon-button" type="button" onClick={addButton} title="新增按钮">
+            <Icons.Plus size={17} />
+          </button>
+        </div>
+
+        <div className="button-config-list">
+          {buttons.map((button, index) => {
+            const recording = recordingId === `button:${button.id}`;
+            return (
+              <div className="button-config-card" key={button.id}>
+                <div className="item-config-header">
+                  <span className="button-list-icon">
+                    <ButtonIcon button={button} size={18} />
+                  </span>
+                  <strong>{button.label || `按钮 ${index + 1}`}</strong>
+                  <div className="row-actions">
+                    <button type="button" onClick={() => moveButton(button.id, -1)} title="上移" disabled={index === 0}>
+                      <Icons.ArrowUp size={15} />
+                    </button>
+                    <button type="button" onClick={() => moveButton(button.id, 1)} title="下移" disabled={index === buttons.length - 1}>
+                      <Icons.ArrowDown size={15} />
+                    </button>
+                    <button type="button" onClick={() => removeButton(button.id)} title="删除按钮" disabled={buttons.length <= 1}>
+                      <Icons.Trash2 size={15} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="field-row">
+                  <label className="field">
+                    <span>名称</span>
+                    <input
+                      value={button.label}
+                      onChange={(event) => updateButton(button.id, { label: event.target.value })}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>图标类型</span>
+                    <select
+                      value={button.iconType}
+                      onChange={(event) => updateButton(button.id, { iconType: event.target.value })}
+                    >
+                      <option value="lucide">内置图标</option>
+                      <option value="image">自定义图片</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="field-row">
+                  {button.iconType === 'lucide' ? (
+                    <div className="field">
+                      <span>图标</span>
+                      {renderIconSelect(button.icon, () => openIconPicker('button', button.id, button.icon))}
+                    </div>
+                  ) : (
+                    <div className="field image-field">
+                      <span>图片</span>
+                      <button type="button" onClick={() => chooseButtonImage(button.id)}>
+                        <Icons.ImagePlus size={16} />
+                        选择图片
+                      </button>
+                    </div>
+                  )}
+
+                  {!isVoiceButton(button) && (
+                    <label className="field">
+                      <span>快捷键</span>
+                      <div className="inline-recorder">
+                        <strong>{shortcutLabelForButton(button, draft)}</strong>
+                        <button
+                          ref={recording ? recorderRef : null}
+                          type="button"
+                          className={recording ? 'is-recording' : ''}
+                          onClick={() => setRecordingId(`button:${button.id}`)}
+                        >
+                          {recording ? '按键中' : '录制'}
+                        </button>
+                      </div>
+                    </label>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  function renderVoiceSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>语音</h2>
+            <p>当前使用：{getActiveVoiceMode(draft).label} · {getActiveVoiceMode(draft).shortcut || '未设置'}</p>
+          </div>
+        </div>
+
+        <div className="voice-mode-list">
+          {VOICE_MODE_ORDER.map((modeId) => {
+            const voiceMode = voiceModes.options[modeId];
+            const selected = voiceModes.activeId === modeId;
+            const recording = recordingId === `voice:${modeId}`;
+            return (
+              <div key={modeId} className={`voice-mode-card ${selected ? 'is-selected' : ''}`}>
+                <button
+                  type="button"
+                  className="voice-mode-selector"
+                  onClick={() => setActiveVoiceMode(modeId)}
+                  title="设为当前语音模式"
+                >
+                  <ButtonIcon button={voiceMode} size={22} />
+                </button>
+
+                <div className="voice-mode-fields">
+                  <div className="field-row">
+                    <button type="button" disabled={selected} onClick={() => setActiveVoiceMode(modeId)}>
+                      {selected ? '当前使用' : '使用此模式'}
+                    </button>
+                    <span>录制快捷键后自动使用此模式</span>
+                  </div>
+                  <div className="field-row">
+                    <label className="field">
+                      <span>名称</span>
+                      <input
+                        value={voiceMode.label}
+                        onChange={(event) => updateVoiceMode(modeId, { label: event.target.value })}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>快捷键</span>
+                      <div className="inline-recorder">
+                        <strong>{voiceMode.shortcut || '未设置'}</strong>
+                        <button
+                          ref={recording ? recorderRef : null}
+                          type="button"
+                          className={recording ? 'is-recording' : ''}
+                          onClick={() => setRecordingId(`voice:${modeId}`)}
+                        >
+                          {recording ? '按键中' : '录制'}
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+
+                  <div className="field-row">
+                    <label className="field">
+                      <span>图标类型</span>
+                      <select
+                        value={voiceMode.iconType}
+                        onChange={(event) => updateVoiceMode(modeId, { iconType: event.target.value })}
+                      >
+                        <option value="lucide">内置图标</option>
+                        <option value="image">自定义图片</option>
+                      </select>
+                    </label>
+                    {voiceMode.iconType === 'lucide' ? (
+                      <div className="field">
+                        <span>图标</span>
+                        {renderIconSelect(voiceMode.icon, () => openIconPicker('voice', modeId, voiceMode.icon))}
+                      </div>
+                    ) : (
+                      <div className="field image-field">
+                        <span>图片</span>
+                        <button type="button" onClick={() => chooseVoiceModeImage(modeId)}>
+                          <Icons.ImagePlus size={16} />
+                          选择图片
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  function renderPunctuationSection() {
+    const screenshotRecording = recordingId === 'tool:screenshot';
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>标点</h2>
+            <p>标点面板里的可选项</p>
+          </div>
+          <button className="small-icon-button" type="button" onClick={addPunctuationItem} title="新增标点">
+            <Icons.Plus size={17} />
+          </button>
+        </div>
+
+        <div className="form-section">
+          <div className="tool-shortcut-setting">
+            <span className="button-list-icon"><Icons.ScanLine size={18} /></span>
+            <span className="tool-shortcut-label">
+              <strong>截图</strong>
+              <small>显示在复制、粘贴、剪切下方</small>
+            </span>
+            <div className="inline-recorder">
+              <strong>{punctuationTools.screenshot.shortcut || '未设置'}</strong>
+              <button
+                ref={screenshotRecording ? recorderRef : null}
+                type="button"
+                className={screenshotRecording ? 'is-recording' : ''}
+                onClick={() => setRecordingId('tool:screenshot')}
+              >
+                {screenshotRecording ? '按键中' : '录制'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="punctuation-config-list">
+          {punctuationItems.map((item, index) => (
+            <div className="punctuation-config-row" key={item.id}>
+              <div className="punctuation-preview">{item.text || '·'}</div>
+              <label className="field">
+                <span>名称</span>
+                <input
+                  value={item.label}
+                  placeholder={`标点 ${index + 1}`}
+                  onChange={(event) => updatePunctuationItem(item.id, { label: event.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span>输入内容</span>
+                <input
+                  value={item.text}
+                  onChange={(event) => updatePunctuationItem(item.id, { text: event.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span>插入后</span>
+                <select
+                  value={item.afterShortcut || ''}
+                  onChange={(event) => updatePunctuationItem(item.id, { afterShortcut: event.target.value })}
+                >
+                  <option value="">不移动</option>
+                  <option value="Left">光标左移</option>
+                </select>
+              </label>
+              <div className="row-actions">
+                <button type="button" onClick={() => movePunctuationItem(item.id, -1)} title="上移" disabled={index === 0}>
+                  <Icons.ArrowUp size={15} />
+                </button>
+                <button type="button" onClick={() => movePunctuationItem(item.id, 1)} title="下移" disabled={index === punctuationItems.length - 1}>
+                  <Icons.ArrowDown size={15} />
+                </button>
+                <button type="button" onClick={() => removePunctuationItem(item.id)} title="删除标点" disabled={punctuationItems.length <= 1}>
+                  <Icons.Trash2 size={15} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function renderAppearanceSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>外观</h2>
+            <p>悬浮框显示样式</p>
+          </div>
+        </div>
+
+        <div className="form-section">
+          <div className="field-row">
+            <label className="field">
+              <span>角落</span>
+              <select value={draft.window.corner} onChange={(event) => setWindowPatch({ corner: event.target.value })}>
+                <option value="top-right">右上</option>
+                <option value="top-left">左上</option>
+                <option value="bottom-right">右下</option>
+                <option value="bottom-left">左下</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>按钮大小 {draft.window.buttonSize}px</span>
+              <input
+                type="range"
+                min="48"
+                max="112"
+                value={draft.window.buttonSize}
+                onChange={(event) => setWindowPatch({ buttonSize: Number(event.target.value) })}
+              />
+            </label>
+          </div>
+
+          <div className="field-row">
+            <label className="field">
+              <span>透明度 {Math.round(draft.window.opacity * 100)}%</span>
+              <input
+                type="range"
+                min="25"
+                max="100"
+                value={Math.round(draft.window.opacity * 100)}
+                onChange={(event) => setWindowPatch({ opacity: Number(event.target.value) / 100 })}
+              />
+            </label>
+            <label className="field">
+              <span>间距 {draft.window.gap}px</span>
+              <input
+                type="range"
+                min="4"
+                max="24"
+                value={draft.window.gap}
+                onChange={(event) => setWindowPatch({ gap: Number(event.target.value) })}
+              />
+            </label>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderDisplaySection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>屏幕</h2>
+            <p>UU 虚拟屏预设</p>
+          </div>
+          <button className="small-icon-button" type="button" onClick={addDisplayPreset} title="新增屏幕预设">
+            <Icons.Plus size={17} />
+          </button>
+        </div>
+
+        <div className="form-section virtual-display-section">
+          <div className="virtual-display-target">
+            <span className="virtual-display-icon"><Icons.Monitor size={18} /></span>
+            <span>
+              <strong>UU 虚拟屏</strong>
+              <small>仅操作 GameViewer Virtual Display Adapter</small>
+              <small>分辨率跟随 UU；连接后可重放 UU 当前缩放</small>
+            </span>
+          </div>
+        </div>
+
+        <div className="form-section remote-automation-section">
+          <label className="switch-field">
+            <span>
+              <strong>连接后刷新 UU 缩放</strong>
+              <small>读取本次设备的 UU 缩放配置并重新应用，不固定比例</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={remoteAutomation.refreshVirtualDisplayScale}
+              onChange={(event) => setRemoteAutomationPatch({ refreshVirtualDisplayScale: event.target.checked })}
+            />
+          </label>
+          <label className="switch-field">
+            <span>
+              <strong>恢复悬浮窗默认位置</strong>
+              <small>UU 连接或断开后回到外观中设置的角落</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={remoteAutomation.resetFloatingWindow}
+              onChange={(event) => setRemoteAutomationPatch({ resetFloatingWindow: event.target.checked })}
+            />
+          </label>
+        </div>
+
+        <div className="display-preset-list">
+          {displayPresets.map((preset, index) => (
+            <div className="display-preset-card" key={preset.id}>
+              <div className="item-config-header">
+                <strong>{preset.label || `设置${index + 1}`}</strong>
+                <div className="row-actions">
+                  <button type="button" onClick={() => moveDisplayPreset(preset.id, -1)} title="上移" disabled={index === 0}>
+                    <Icons.ArrowUp size={15} />
+                  </button>
+                  <button type="button" onClick={() => moveDisplayPreset(preset.id, 1)} title="下移" disabled={index === displayPresets.length - 1}>
+                    <Icons.ArrowDown size={15} />
+                  </button>
+                  <button type="button" onClick={() => removeDisplayPreset(preset.id)} title="删除预设" disabled={displayPresets.length <= 1}>
+                    <Icons.Trash2 size={15} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="field-row">
+                <label className="field">
+                  <span>名称</span>
+                  <input
+                    value={preset.label}
+                    onChange={(event) => updateDisplayPreset(preset.id, { label: event.target.value })}
+                  />
+                </label>
+                <label className="field">
+                  <span>方向</span>
+                  <select
+                    value={preset.orientation}
+                    onChange={(event) => updateDisplayPreset(preset.id, { orientation: event.target.value })}
+                  >
+                    <option value="landscape">横向</option>
+                    <option value="portrait">纵向</option>
+                    <option value="landscape-flipped">横向翻转</option>
+                    <option value="portrait-flipped">纵向翻转</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="system-display-note">
+                <Icons.Info size={15} />
+                <span>手动点击预设时只切换方向，沿用系统当前像素尺寸与缩放。</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function renderSystemSection() {
+    return (
+      <div className="settings-section-page">
+        <div className="section-heading">
+          <div>
+            <h2>系统</h2>
+            <p>Windows 启动行为</p>
+          </div>
+        </div>
+
+        <div className="form-section">
+          <label className={`switch-field ${startup.supported ? '' : 'is-disabled'}`}>
+            <span>
+              <strong>开机自启动</strong>
+              <small>{startup.supported ? '跟随 Windows 登录启动' : '打包版中可用'}</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={startup.enabled}
+              disabled={!startup.supported}
+              onChange={toggleStartup}
+            />
+          </label>
+        </div>
+
+        <div className="form-section">
+          <button type="button" className="danger-ghost-button" onClick={restoreDefaults}>
+            <Icons.RotateCcw size={16} />
+            全部恢复默认
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderActiveSection() {
+    if (activeSection === 'voice') return renderVoiceSection();
+    if (activeSection === 'punctuation') return renderPunctuationSection();
+    if (activeSection === 'appearance') return renderAppearanceSection();
+    if (activeSection === 'display') return renderDisplaySection();
+    if (activeSection === 'system') return renderSystemSection();
+    return renderButtonsSection();
   }
 
   return (
@@ -895,321 +1532,24 @@ function SettingsApp() {
         </header>
 
         <div className="settings-grid">
-          <aside className="button-list-panel">
-            <div className="panel-heading">
-              <span>按钮</span>
-              <button className="small-icon-button" type="button" onClick={addButton} title="新增按钮">
-                <Icons.Plus size={17} />
+          <aside className="settings-nav" aria-label="设置分类">
+            {SETTINGS_SECTIONS.map((section) => (
+              <button
+                key={section.id}
+                type="button"
+                className={`settings-nav-button ${activeSection === section.id ? 'is-selected' : ''}`}
+                onClick={() => setActiveSection(section.id)}
+              >
+                {section.label}
               </button>
-            </div>
-
-            <div className="button-list">
-              {draft.buttons.map((button) => (
-                <button
-                  key={button.id}
-                  type="button"
-                  className={`button-list-item ${button.id === selectedButton?.id ? 'is-selected' : ''}`}
-                  onClick={() => setSelectedId(button.id)}
-                >
-                  <span className="button-list-icon">
-                    <ButtonIcon button={button} size={18} />
-                  </span>
-                  <span className="button-list-copy">
-                    <strong>{button.label}</strong>
-                    <small>{shortcutLabelForButton(button, draft)}</small>
-                  </span>
-                </button>
-              ))}
-            </div>
-
-            <div className="list-actions">
-              <button type="button" onClick={() => moveSelectedButton(-1)} title="上移">
-                <Icons.ArrowUp size={16} />
-              </button>
-              <button type="button" onClick={() => moveSelectedButton(1)} title="下移">
-                <Icons.ArrowDown size={16} />
-              </button>
-              <button type="button" onClick={removeSelectedButton} title="删除按钮" disabled={draft.buttons.length <= 1}>
-                <Icons.Trash2 size={16} />
-              </button>
-            </div>
+            ))}
           </aside>
 
           <section className="editor-panel">
-            {selectedButton ? (
-              <>
-                <div className="form-section">
-                  <h2>按钮内容</h2>
-                  <label className="field">
-                    <span>名称</span>
-                    <input
-                      value={selectedButton.label}
-                      onChange={(event) => updateButton(selectedButton.id, { label: event.target.value })}
-                    />
-                  </label>
-
-                  <div className="field-row">
-                    <label className="field">
-                      <span>图标类型</span>
-                      <select
-                        value={selectedButton.iconType}
-                        onChange={(event) => updateButton(selectedButton.id, { iconType: event.target.value })}
-                      >
-                        <option value="lucide">内置图标</option>
-                        <option value="image">自定义图片</option>
-                      </select>
-                    </label>
-
-                    {selectedButton.iconType === 'lucide' ? (
-                      <label className="field">
-                        <span>Lucide 图标名</span>
-                        <input
-                          value={selectedButton.icon}
-                          onChange={(event) => updateButton(selectedButton.id, { icon: event.target.value })}
-                          placeholder="Mic"
-                        />
-                      </label>
-                    ) : (
-                      <div className="field image-field">
-                        <span>图片</span>
-                        <button type="button" onClick={chooseButtonImage}>
-                          <Icons.ImagePlus size={16} />
-                          选择图片
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>快捷键</h2>
-                  <div className="shortcut-recorder">
-                    <div>
-                      <span>当前</span>
-                      <strong>{shortcutLabelForButton(selectedButton, draft)}</strong>
-                    </div>
-                    <button
-                      ref={recorderRef}
-                      type="button"
-                      className={recordingId === `button:${selectedButton.id}` ? 'is-recording' : ''}
-                      onClick={() => setRecordingId(`button:${selectedButton.id}`)}
-                    >
-                      {recordingId === `button:${selectedButton.id}` ? '按下快捷键...' : '录制快捷键'}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>语音模式</h2>
-                  <div className="voice-mode-list">
-                    {VOICE_MODE_ORDER.map((modeId) => {
-                      const voiceMode = voiceModes.options[modeId];
-                      const selected = voiceModes.activeId === modeId;
-                      const recording = recordingId === `voice:${modeId}`;
-                      return (
-                        <div key={modeId} className={`voice-mode-card ${selected ? 'is-selected' : ''}`}>
-                          <button
-                            type="button"
-                            className="voice-mode-selector"
-                            onClick={() => setActiveVoiceMode(modeId)}
-                            title="设为当前语音模式"
-                          >
-                            <ButtonIcon button={voiceMode} size={22} />
-                          </button>
-
-                          <div className="voice-mode-fields">
-                            <div className="field-row">
-                              <label className="field">
-                                <span>名称</span>
-                                <input
-                                  value={voiceMode.label}
-                                  onChange={(event) => updateVoiceMode(modeId, { label: event.target.value })}
-                                />
-                              </label>
-                              <label className="field">
-                                <span>快捷键</span>
-                                <div className="inline-recorder">
-                                  <strong>{voiceMode.shortcut || '未设置'}</strong>
-                                  <button
-                                    type="button"
-                                    className={recording ? 'is-recording' : ''}
-                                    onClick={() => setRecordingId(`voice:${modeId}`)}
-                                  >
-                                    {recording ? '按键中' : '录制'}
-                                  </button>
-                                </div>
-                              </label>
-                            </div>
-
-                            <div className="field-row">
-                              <label className="field">
-                                <span>图标类型</span>
-                                <select
-                                  value={voiceMode.iconType}
-                                  onChange={(event) => updateVoiceMode(modeId, { iconType: event.target.value })}
-                                >
-                                  <option value="lucide">内置图标</option>
-                                  <option value="image">自定义图片</option>
-                                </select>
-                              </label>
-                              {voiceMode.iconType === 'lucide' ? (
-                                <label className="field">
-                                  <span>Lucide 图标名</span>
-                                  <input
-                                    value={voiceMode.icon}
-                                    onChange={(event) => updateVoiceMode(modeId, { icon: event.target.value })}
-                                  />
-                                </label>
-                              ) : (
-                                <div className="field image-field">
-                                  <span>图片</span>
-                                  <button type="button" onClick={() => chooseVoiceModeImage(modeId)}>
-                                    <Icons.ImagePlus size={16} />
-                                    选择图片
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>窗口</h2>
-                  <div className="field-row">
-                    <label className="field">
-                      <span>角落</span>
-                      <select value={draft.window.corner} onChange={(event) => setWindowPatch({ corner: event.target.value })}>
-                        <option value="top-right">右上</option>
-                        <option value="top-left">左上</option>
-                        <option value="bottom-right">右下</option>
-                        <option value="bottom-left">左下</option>
-                      </select>
-                    </label>
-                    <label className="field">
-                      <span>按钮大小 {draft.window.buttonSize}px</span>
-                      <input
-                        type="range"
-                        min="48"
-                        max="112"
-                        value={draft.window.buttonSize}
-                        onChange={(event) => setWindowPatch({ buttonSize: Number(event.target.value) })}
-                      />
-                    </label>
-                  </div>
-
-                  <div className="field-row">
-                    <label className="field">
-                      <span>透明度 {Math.round(draft.window.opacity * 100)}%</span>
-                      <input
-                        type="range"
-                        min="25"
-                        max="100"
-                        value={Math.round(draft.window.opacity * 100)}
-                        onChange={(event) => setWindowPatch({ opacity: Number(event.target.value) / 100 })}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>间距 {draft.window.gap}px</span>
-                      <input
-                        type="range"
-                        min="4"
-                        max="24"
-                        value={draft.window.gap}
-                        onChange={(event) => setWindowPatch({ gap: Number(event.target.value) })}
-                      />
-                    </label>
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <h2>系统</h2>
-                  <label className={`switch-field ${startup.supported ? '' : 'is-disabled'}`}>
-                    <span>
-                      <strong>开机自启动</strong>
-                      <small>{startup.supported ? '跟随 Windows 登录启动' : '打包版中可用'}</small>
-                    </span>
-                    <input
-                      type="checkbox"
-                      checked={startup.enabled}
-                      disabled={!startup.supported}
-                      onChange={toggleStartup}
-                    />
-                  </label>
-                </div>
-
-                <div className="form-section">
-                  <h2>平板适配预设</h2>
-                  <div className="field-row">
-                    <label className="field">
-                      <span>分辨率宽度</span>
-                      <input
-                        type="number"
-                        min="0"
-                        max="10000"
-                        value={tabletPreset.width || ''}
-                        placeholder="保持当前"
-                        onChange={(event) => setTabletPresetPatch({ width: Number(event.target.value) || 0 })}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>分辨率高度</span>
-                      <input
-                        type="number"
-                        min="0"
-                        max="10000"
-                        value={tabletPreset.height || ''}
-                        placeholder="保持当前"
-                        onChange={(event) => setTabletPresetPatch({ height: Number(event.target.value) || 0 })}
-                      />
-                    </label>
-                  </div>
-
-                  <div className="field-row">
-                    <label className="field">
-                      <span>缩放比例</span>
-                      <input
-                        type="number"
-                        min="100"
-                        max="350"
-                        step="25"
-                        value={tabletPreset.scale}
-                        onChange={(event) => setTabletPresetPatch({ scale: Number(event.target.value) || 175 })}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>屏幕方向</span>
-                      <select
-                        value={tabletPreset.orientation}
-                        onChange={(event) => setTabletPresetPatch({ orientation: event.target.value })}
-                      >
-                        <option value="portrait">纵向</option>
-                        <option value="landscape">横向</option>
-                        <option value="portrait-flipped">纵向翻转</option>
-                        <option value="landscape-flipped">横向翻转</option>
-                      </select>
-                    </label>
-                  </div>
-
-                  <p className="field-hint">从右下角托盘图标左键菜单点击“适配平板”后应用；缩放比例可能需要注销或重新登录后完全生效。</p>
-                </div>
-              </>
-            ) : null}
+            {renderActiveSection()}
           </section>
         </div>
-
-        <footer className="settings-footer">
-          <button type="button" className="ghost-button" onClick={() => setDraft(config)}>
-            还原
-          </button>
-          <button type="button" className="primary-button" onClick={save}>
-            <Icons.Save size={17} />
-            保存并应用
-          </button>
-        </footer>
+        {renderIconPicker()}
       </section>
     </main>
   );
@@ -1238,8 +1578,16 @@ function ButtonIcon({ button, size }) {
     return <img className="custom-button-image" src={button.image} alt="" draggable="false" />;
   }
 
-  const Icon = Icons[button.icon] || Icons.Circle;
+  return <LucideIcon name={button.icon} size={size} />;
+}
+
+function LucideIcon({ name, size }) {
+  const Icon = Icons[name] || Icons.Circle;
   return <Icon size={size} strokeWidth={2.35} />;
+}
+
+function iconLabel(iconName) {
+  return ICON_PICKER_ITEMS.find((item) => item.icon === iconName)?.label || iconName || '圆形';
 }
 
 function getVoiceModes(config) {
@@ -1271,24 +1619,12 @@ function getActiveVoiceMode(config) {
   return voiceModes.options[voiceModes.activeId] || voiceModes.options.lightning;
 }
 
-function getTabletPreset(config) {
-  const source = config.tabletPreset || defaultTabletPreset;
-  const orientation = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(source.orientation)
-    ? source.orientation
-    : defaultTabletPreset.orientation;
-
-  return {
-    width: Math.max(0, Math.round(Number(source.width) || 0)),
-    height: Math.max(0, Math.round(Number(source.height) || 0)),
-    scale: Math.min(Math.max(Math.round(Number(source.scale) || defaultTabletPreset.scale), 100), 350),
-    orientation
-  };
-}
-
 function getPunctuationItems(config) {
-  const source = defaultPunctuationItems;
+  const items = Array.isArray(config.punctuationItems) && config.punctuationItems.length
+    ? config.punctuationItems
+    : defaultPunctuationItems;
 
-  return source
+  return items
     .map((item, index) => ({
       id: item.id || `punctuation-${index}`,
       label: item.label || `标点 ${index + 1}`,
@@ -1298,27 +1634,101 @@ function getPunctuationItems(config) {
     .filter((item) => item.text);
 }
 
+function getEditablePunctuationItems(config) {
+  const items = Array.isArray(config.punctuationItems) && config.punctuationItems.length
+    ? config.punctuationItems
+    : defaultPunctuationItems;
+
+  return items.map((item, index) => ({
+    id: item.id || `punctuation-${index}`,
+    label: Object.prototype.hasOwnProperty.call(item, 'label') ? item.label : `标点 ${index + 1}`,
+    text: item.text || '',
+    afterShortcut: item.afterShortcut || ''
+  }));
+}
+
+function getPunctuationTools(config) {
+  const source = config.punctuationTools && typeof config.punctuationTools === 'object'
+    ? config.punctuationTools
+    : {};
+  const screenshot = source.screenshot && typeof source.screenshot === 'object'
+    ? source.screenshot
+    : {};
+  return {
+    screenshot: {
+      ...defaultPunctuationTools.screenshot,
+      ...screenshot,
+      id: 'screenshot'
+    }
+  };
+}
+
+function getPunctuationToolItems(config) {
+  return [
+    ...PUNCTUATION_TOOL_ITEMS,
+    getPunctuationTools(config).screenshot
+  ];
+}
+
+function getEditableDisplayPresets(config) {
+  const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
+    ? config.displayPresets
+    : defaultDisplayPresets;
+
+  return presets.map((preset, index) => {
+    const fallback = defaultDisplayPresets[index] || defaultDisplayPresets[0];
+    return {
+      id: preset.id || `preset-${index + 1}`,
+      label: preset.label || `设置${index + 1}`,
+      orientation: ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
+        ? preset.orientation
+        : fallback.orientation,
+      target: 'gameviewer-virtual'
+    };
+  });
+}
+
+function getRemoteAutomation(config) {
+  const source = config.remoteAutomation && typeof config.remoteAutomation === 'object'
+    ? config.remoteAutomation
+    : defaultRemoteAutomation;
+  return {
+    refreshVirtualDisplayScale: source.refreshVirtualDisplayScale !== false,
+    resetFloatingWindow: source.resetFloatingWindow !== false
+  };
+}
+
+function moveById(items, id, direction) {
+  const nextItems = [...items];
+  const index = nextItems.findIndex((item) => item.id === id);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= nextItems.length) return items;
+  const [item] = nextItems.splice(index, 1);
+  nextItems.splice(nextIndex, 0, item);
+  return nextItems;
+}
+
 function shortcutLabelForButton(button, config) {
+  if (isPunctuationButton(button)) {
+    return '标点面板';
+  }
+
   if (isVoiceButton(button)) {
     const activeMode = getActiveVoiceMode(config);
     return `${activeMode.label} · ${activeMode.shortcut || '未设置'}`;
-  }
-
-  if (isPunctuationButton(button)) {
-    return '点击展开标点';
   }
 
   return button.shortcut || '未设置';
 }
 
 function buttonTitle(button, config) {
+  if (isPunctuationButton(button)) {
+    return `${button.label} · 标点面板`;
+  }
+
   if (isVoiceButton(button)) {
     const activeMode = getActiveVoiceMode(config);
     return `${button.label} · ${activeMode.label} · ${activeMode.shortcut || '未设置'}`;
-  }
-
-  if (isPunctuationButton(button)) {
-    return `${button.label} · 点击展开标点`;
   }
 
   return `${button.label} · ${button.shortcut || '未设置'}`;
@@ -1342,8 +1752,10 @@ function isSendButton(button) {
   return button.id === 'send' || shortcut === 'enter';
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+function isPointerInside(event, element) {
+  if (!event || !element) return false;
+  const rect = element.getBoundingClientRect();
+  return event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
 }
 
 function formatShortcut(event) {

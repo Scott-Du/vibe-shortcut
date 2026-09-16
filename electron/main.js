@@ -2,23 +2,58 @@ const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage,
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+  GAMEVIEWER_ADAPTER_NAME,
+  applyVirtualDisplayProfile,
+  createOrientationDisplayProfile,
+  createLatestIntentQueue,
+  getVirtualDisplayConfiguredScale,
+  getVirtualDisplayEffectiveScale,
+  getVirtualDisplayStatus,
+  readGameViewerConfiguredScale,
+  reapplyVirtualDisplayScale
+} = require('./virtual-display');
+const { GameViewerSessionWatcher } = require('./gameviewer-session');
+const {
+  isDoubaoVoiceShortcut,
+  shortcutNeedsNativeSender,
+  shortcutToNativeEvents
+} = require('./shortcut-input');
 
 const DEV_URL = 'http://127.0.0.1:5173';
-const DEFAULT_TABLET_PRESET = {
-  width: 0,
-  height: 0,
-  scale: 175,
-  orientation: 'portrait'
-};
+const LIGHTNING_VOICE_IMAGE = 'vibe-asset://voice-lightning.png';
+const DOUBAO_VOICE_IMAGE = 'vibe-asset://voice-doubao.png';
 const DEFAULT_PUNCTUATION_ITEMS = [
   { id: 'comma', label: '逗号', text: '，' },
   { id: 'period', label: '句号', text: '。' },
   { id: 'exclamation', label: '感叹号', text: '！' },
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
 ];
-
+const DEFAULT_PUNCTUATION_TOOLS = {
+  screenshot: {
+    id: 'screenshot',
+    label: '截图',
+    icon: 'ScanLine',
+    shortcut: 'Ctrl+Q'
+  }
+};
+const DEFAULT_DISPLAY_PRESETS = [
+  { id: 'preset-1', label: '设置一', orientation: 'portrait', target: 'gameviewer-virtual' },
+  { id: 'preset-2', label: '设置二', orientation: 'landscape', target: 'gameviewer-virtual' }
+];
+const DEFAULT_VIRTUAL_DISPLAY = {
+  adapterName: GAMEVIEWER_ADAPTER_NAME,
+  lastOrientation: 'portrait',
+  lastPresetId: 'preset-1'
+};
+const DEFAULT_REMOTE_AUTOMATION = {
+  refreshVirtualDisplayScale: true,
+  resetFloatingWindow: true
+};
+const UU_SCALE_SETTLE_DELAY_MS = 4000;
+const UU_SCALE_VERIFY_DELAY_MS = 1800;
 const DEFAULT_CONFIG = {
-  schemaVersion: 5,
+  schemaVersion: 11,
   buttons: [
     {
       id: 'punctuation',
@@ -54,7 +89,10 @@ const DEFAULT_CONFIG = {
     }
   ],
   punctuationItems: DEFAULT_PUNCTUATION_ITEMS,
-  tabletPreset: DEFAULT_TABLET_PRESET,
+  punctuationTools: DEFAULT_PUNCTUATION_TOOLS,
+  displayPresets: DEFAULT_DISPLAY_PRESETS,
+  virtualDisplay: DEFAULT_VIRTUAL_DISPLAY,
+  remoteAutomation: DEFAULT_REMOTE_AUTOMATION,
   voiceModes: {
     activeId: 'lightning',
     options: {
@@ -71,7 +109,7 @@ const DEFAULT_CONFIG = {
         label: '闪电说',
         iconType: 'image',
         icon: 'Zap',
-        image: 'vibe-asset://voice-lightning.png',
+        image: LIGHTNING_VOICE_IMAGE,
         shortcut: 'Ctrl+I'
       }
     }
@@ -86,25 +124,50 @@ const DEFAULT_CONFIG = {
 
 let floatingWindow;
 let settingsWindow;
-let quickWindow;
 let tray;
 let config;
+let repeatProcess;
 let sideActionsOpen = false;
-let quickWindowCloseTimer;
 let inputSenderProcess;
 let inputSenderBuffer = '';
 let inputSenderRequestId = 0;
-let floatingDragSession = null;
+const virtualDisplayIntent = createLatestIntentQueue();
+let virtualDisplayNativeOrigin;
+let gameViewerSessionConnected;
+let gameViewerSessionWatcher;
+let gameViewerSessionAutomationTimer;
+let gameViewerSessionRevision = 0;
+let virtualDisplayConnectionSyncTimer;
+let virtualDisplayConnectionSyncRevision = 0;
+let displayAddedHandler;
+let displayRemovedHandler;
+let displayMetricsChangedHandler;
+let floatingResetTimer;
 const inputSenderPending = new Map();
 
 function configPath() {
   return path.join(app.getPath('userData'), 'config.json');
 }
 
+function displayAutomationLogPath() {
+  return path.join(app.getPath('userData'), 'display-automation.log');
+}
+
+function logDisplayAutomation(event, details = {}) {
+  try {
+    fs.appendFileSync(
+      displayAutomationLogPath(),
+      `${new Date().toISOString()} ${event} ${JSON.stringify(details)}\n`,
+      'utf8'
+    );
+  } catch {
+    // Diagnostics must never interrupt display recovery.
+  }
+}
+
 function mergeConfig(value) {
   const rawValue = value && typeof value === 'object' ? value : {};
   const rawSchemaVersion = Number(rawValue.schemaVersion) || 1;
-  const isLegacyConfig = rawSchemaVersion < DEFAULT_CONFIG.schemaVersion;
   const legacyVoiceButton = Array.isArray(rawValue.buttons)
     ? rawValue.buttons.find((button) => button && button.id === 'voice')
     : null;
@@ -130,11 +193,21 @@ function mergeConfig(value) {
     image: button.image || '',
     shortcut: button.shortcut || ''
   }));
-  next.buttons = ensureRequiredButtons(next.buttons);
 
+  next.buttons = ensureRequiredButtons(next.buttons);
   next.punctuationItems = mergePunctuationItems(rawValue.punctuationItems);
-  next.tabletPreset = mergeTabletPreset(rawValue.tabletPreset);
+  next.punctuationTools = mergePunctuationTools(rawValue.punctuationTools);
+  next.displayPresets = mergeDisplayPresets(rawValue.displayPresets, rawSchemaVersion);
+  next.virtualDisplay = mergeVirtualDisplay(rawValue.virtualDisplay, next.displayPresets);
+  next.remoteAutomation = mergeRemoteAutomation(rawValue.remoteAutomation);
   next.voiceModes = mergeVoiceModes(rawValue.voiceModes, legacyVoiceButton, rawSchemaVersion);
+  next.voiceModes = reconcileVoiceButtonShortcut(next.voiceModes, legacyVoiceButton, rawSchemaVersion);
+  const activeVoiceMode = next.voiceModes.options[next.voiceModes.activeId];
+  next.buttons = next.buttons.map((button) => (
+    button.id === 'voice'
+      ? { ...button, shortcut: activeVoiceMode?.shortcut || '' }
+      : button
+  ));
   next.window.buttonSize = clamp(Number(next.window.buttonSize) || 64, 48, 112);
   next.window.gap = clamp(Number(next.window.gap) || 10, 4, 24);
   next.window.opacity = clamp(Number(next.window.opacity) || 0.78, 0.25, 1);
@@ -150,38 +223,94 @@ function mergeConfig(value) {
 }
 
 function ensureRequiredButtons(buttons) {
-  const punctuationButton = buttons.find((button) => button.id === 'punctuation') || {
-    ...DEFAULT_CONFIG.buttons.find((button) => button.id === 'punctuation')
-  };
+  const existingIds = new Set(buttons.map((button) => button.id));
+  const requiredButtons = DEFAULT_CONFIG.buttons.filter((button) => !existingIds.has(button.id));
   return [
-    punctuationButton,
-    ...buttons.filter((button) => button.id !== 'punctuation')
+    ...requiredButtons,
+    ...buttons
   ];
 }
 
 function mergePunctuationItems(value) {
-  const source = DEFAULT_PUNCTUATION_ITEMS;
-  return source
+  const items = Array.isArray(value) && value.length ? value : DEFAULT_PUNCTUATION_ITEMS;
+  return items
     .map((item, index) => ({
       id: item && item.id ? String(item.id) : `punctuation-${index}`,
-      label: item && item.label ? String(item.label) : `标点 ${index + 1}`,
+      label: item && Object.prototype.hasOwnProperty.call(item, 'label') ? String(item.label) : `标点 ${index + 1}`,
       text: item && item.text ? String(item.text) : '',
       afterShortcut: item && item.afterShortcut ? String(item.afterShortcut) : ''
-    }))
-    .filter((item) => item.text);
+    }));
 }
 
-function mergeTabletPreset(value) {
+function mergePunctuationTools(value) {
   const source = value && typeof value === 'object' ? value : {};
-  const orientation = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(source.orientation)
-    ? source.orientation
-    : DEFAULT_TABLET_PRESET.orientation;
+  const screenshot = source.screenshot && typeof source.screenshot === 'object'
+    ? source.screenshot
+    : {};
+  return {
+    screenshot: {
+      ...DEFAULT_PUNCTUATION_TOOLS.screenshot,
+      ...screenshot,
+      id: 'screenshot',
+      label: screenshot.label ? String(screenshot.label) : DEFAULT_PUNCTUATION_TOOLS.screenshot.label,
+      icon: screenshot.icon ? String(screenshot.icon) : DEFAULT_PUNCTUATION_TOOLS.screenshot.icon,
+      shortcut: Object.prototype.hasOwnProperty.call(screenshot, 'shortcut')
+        ? String(screenshot.shortcut)
+        : DEFAULT_PUNCTUATION_TOOLS.screenshot.shortcut
+    }
+  };
+}
+
+function mergeDisplayPresets(value, schemaVersion = DEFAULT_CONFIG.schemaVersion) {
+  const source = Array.isArray(value) && value.length ? value : DEFAULT_DISPLAY_PRESETS;
+  const presets = source
+    .map((preset, index) => normalizeDisplayPreset(preset, index, schemaVersion))
+    .filter(Boolean);
+  return presets.length ? presets : DEFAULT_DISPLAY_PRESETS.map((preset, index) => normalizeDisplayPreset(preset, index));
+}
+
+function normalizeDisplayPreset(value, index = 0, schemaVersion = DEFAULT_CONFIG.schemaVersion) {
+  const preset = value && typeof value === 'object' ? value : {};
+  const fallback = DEFAULT_DISPLAY_PRESETS[index] || DEFAULT_DISPLAY_PRESETS[0];
+  const id = preset.id ? String(preset.id) : `preset-${index + 1}`;
+  const migrateBuiltInPreset = schemaVersion < 6 && ['preset-1', 'preset-2'].includes(id);
+  const orientation = migrateBuiltInPreset
+    ? fallback.orientation
+    : (['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
+        ? preset.orientation
+        : fallback.orientation);
 
   return {
-    width: clamp(Math.round(Number(source.width) || DEFAULT_TABLET_PRESET.width), 0, 10000),
-    height: clamp(Math.round(Number(source.height) || DEFAULT_TABLET_PRESET.height), 0, 10000),
-    scale: clamp(Math.round(Number(source.scale) || DEFAULT_TABLET_PRESET.scale), 100, 350),
-    orientation
+    id,
+    label: preset.label ? String(preset.label) : `设置${index + 1}`,
+    orientation,
+    target: 'gameviewer-virtual'
+  };
+}
+
+function mergeVirtualDisplay(value, displayPresets) {
+  const source = value && typeof value === 'object' ? value : {};
+  const orientations = ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'];
+  const lastOrientation = orientations.includes(source.lastOrientation)
+    ? source.lastOrientation
+    : DEFAULT_VIRTUAL_DISPLAY.lastOrientation;
+  const requestedPresetId = source.lastPresetId ? String(source.lastPresetId) : '';
+  const matchingPreset = displayPresets.find((preset) => preset.id === requestedPresetId)
+    || displayPresets.find((preset) => preset.orientation === lastOrientation)
+    || displayPresets[0];
+
+  return {
+    adapterName: GAMEVIEWER_ADAPTER_NAME,
+    lastOrientation: matchingPreset?.orientation || lastOrientation,
+    lastPresetId: matchingPreset?.id || DEFAULT_VIRTUAL_DISPLAY.lastPresetId
+  };
+}
+
+function mergeRemoteAutomation(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    refreshVirtualDisplayScale: source.refreshVirtualDisplayScale !== false,
+    resetFloatingWindow: source.resetFloatingWindow !== false
   };
 }
 
@@ -219,6 +348,14 @@ function mergeVoiceModes(value, legacyVoiceButton, schemaVersion) {
         options[id].shortcut = fallback.shortcut;
       }
     }
+
+    const usesBundledLightningImage =
+      id === 'lightning'
+      && options[id].iconType === 'image'
+      && options[id].image === LIGHTNING_VOICE_IMAGE;
+    if (usesBundledLightningImage && /(?:豆包|doubao)/i.test(options[id].label)) {
+      options[id].image = DOUBAO_VOICE_IMAGE;
+    }
   }
 
   if (!value && legacyVoiceButton && legacyVoiceButton.shortcut) {
@@ -229,50 +366,98 @@ function mergeVoiceModes(value, legacyVoiceButton, schemaVersion) {
   return { activeId, options };
 }
 
+function reconcileVoiceButtonShortcut(voiceModes, legacyVoiceButton, schemaVersion) {
+  if (schemaVersion >= DEFAULT_CONFIG.schemaVersion) return voiceModes;
+
+  const legacyShortcut = String(legacyVoiceButton?.shortcut || '').trim();
+  if (!legacyShortcut) return voiceModes;
+
+  const normalizeShortcut = (value) => String(value || '').replace(/\s+/g, '').toLowerCase();
+  const legacyIdentity = normalizeShortcut(legacyShortcut);
+  const activeMode = voiceModes.options[voiceModes.activeId];
+  if (normalizeShortcut(activeMode?.shortcut) === legacyIdentity) return voiceModes;
+
+  const matchingMode = Object.values(voiceModes.options).find((mode) => (
+    normalizeShortcut(mode.shortcut) === legacyIdentity
+  ));
+  if (matchingMode) {
+    return { ...voiceModes, activeId: matchingMode.id };
+  }
+
+  return {
+    ...voiceModes,
+    options: {
+      ...voiceModes.options,
+      [voiceModes.activeId]: {
+        ...activeMode,
+        shortcut: legacyShortcut
+      }
+    }
+  };
+}
+
 function loadConfig() {
   try {
     const raw = fs.readFileSync(configPath(), 'utf8');
-    return mergeConfig(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const merged = mergeConfig(parsed);
+    if (Number(parsed.schemaVersion) !== DEFAULT_CONFIG.schemaVersion) {
+      fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+      fs.writeFileSync(configPath(), JSON.stringify(merged, null, 2), 'utf8');
+    }
+    return merged;
   } catch {
     return mergeConfig(DEFAULT_CONFIG);
   }
 }
 
-function saveConfig(nextConfig) {
-  const previousConfig = config;
+function saveConfig(nextConfig, options = {}) {
+  const previousLayoutSignature = config ? floatingLayoutSignature(config) : null;
+  const previousDisplaySignature = config ? virtualDisplayConfigSignature(config) : null;
   config = mergeConfig(nextConfig);
+  const nextLayoutSignature = floatingLayoutSignature(config);
+  const nextDisplaySignature = virtualDisplayConfigSignature(config);
+  if (
+    previousDisplaySignature !== null
+    && previousDisplaySignature !== nextDisplaySignature
+    && !options.preserveVirtualDisplayIntent
+  ) {
+    beginVirtualDisplayIntent();
+  }
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(config, null, 2), 'utf8');
-  if (shouldResizeFloatingWindow(previousConfig, config)) {
+  if (!options.preserveFloatingBounds && previousLayoutSignature !== nextLayoutSignature) {
     resizeFloatingWindow();
   } else {
-    applyFloatingInputShape();
+    updateFloatingWindowShape();
   }
   broadcastConfig();
   return config;
 }
 
-function shouldResizeFloatingWindow(previousConfig, nextConfig) {
-  if (!previousConfig) return true;
+function floatingLayoutSignature(targetConfig) {
+  return JSON.stringify({
+    window: targetConfig.window,
+    buttonCount: Array.isArray(targetConfig.buttons) ? targetConfig.buttons.length : 0
+  });
+}
 
-  const previousWindow = previousConfig.window || {};
-  const nextWindow = nextConfig.window || {};
-  if (previousWindow.corner !== nextWindow.corner) return true;
-  if (previousWindow.buttonSize !== nextWindow.buttonSize) return true;
-  if (previousWindow.gap !== nextWindow.gap) return true;
-
-  const previousButtons = Array.isArray(previousConfig.buttons) ? previousConfig.buttons : [];
-  const nextButtons = Array.isArray(nextConfig.buttons) ? nextConfig.buttons : [];
-  if (previousButtons.length !== nextButtons.length) return true;
-
-  return previousButtons.some((button, index) => button.id !== nextButtons[index]?.id);
+function virtualDisplayConfigSignature(targetConfig) {
+  return JSON.stringify({
+    displayPresets: targetConfig.displayPresets,
+    virtualDisplay: targetConfig.virtualDisplay
+  });
 }
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-function floatingMetrics() {
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function floatingSize(open = true) {
   const padding = 12;
   const edgePadding = 8;
   const buttonSize = config.window.buttonSize;
@@ -282,45 +467,38 @@ function floatingMetrics() {
   const shellWidth = buttonSize + padding * 2;
   const shellHeight = padding * 2 + stackHeight;
   const sideButtonSize = Math.round(buttonSize * 0.78);
-  const sideExtraWidth = sideButtonSize * 2 + gap * 3;
+  const sideExtraWidth = open ? sideButtonSize * 2 + gap * 3 : 0;
 
   return {
-    padding,
-    edgePadding,
-    buttonSize,
-    gap,
-    buttonCount,
-    stackHeight,
-    shellWidth,
-    shellHeight,
-    sideButtonSize,
-    sideExtraWidth,
     width: Math.round(shellWidth + edgePadding * 2 + sideExtraWidth),
     height: Math.round(shellHeight + edgePadding * 2)
   };
 }
 
-function floatingSize() {
-  const metrics = floatingMetrics();
-  return { width: metrics.width, height: metrics.height };
-}
-
-function floatingBounds(corner = config.window.corner) {
-  const display = screen.getPrimaryDisplay();
+function floatingBounds() {
+  const display = floatingTargetDisplay();
   const workArea = display.workArea;
   const margin = 18;
-  const size = floatingSize();
-  const targetCorner = ['top-left', 'top-right', 'bottom-left', 'bottom-right'].includes(corner)
-    ? corner
-    : DEFAULT_CONFIG.window.corner;
-  const x = targetCorner.includes('right')
+  const size = floatingSize(true);
+  const x = config.window.corner.includes('right')
     ? workArea.x + workArea.width - size.width - margin
     : workArea.x + margin;
-  const y = targetCorner.includes('bottom')
+  const y = config.window.corner.includes('bottom')
     ? workArea.y + workArea.height - size.height - margin
     : workArea.y + margin;
 
   return { x: Math.round(x), y: Math.round(y), ...size };
+}
+
+function floatingTargetDisplay() {
+  if (gameViewerSessionConnected === true && virtualDisplayNativeOrigin) {
+    const matchingDisplay = screen.getAllDisplays().find((display) => (
+      display.nativeOrigin?.x === virtualDisplayNativeOrigin.x
+      && display.nativeOrigin?.y === virtualDisplayNativeOrigin.y
+    ));
+    if (matchingDisplay) return matchingDisplay;
+  }
+  return screen.getPrimaryDisplay();
 }
 
 function loadRenderer(window, mode) {
@@ -386,10 +564,16 @@ function createFloatingWindow() {
   });
 
   floatingWindow.setAlwaysOnTop(true, 'screen-saver');
-  applyFloatingInputShape();
-  floatingWindow.once('ready-to-show', () => floatingWindow.showInactive());
+  updateFloatingWindowShape();
+  floatingWindow.once('ready-to-show', () => {
+    floatingWindow.showInactive();
+    updateTrayMenu();
+  });
+  floatingWindow.on('show', () => updateTrayMenu());
+  floatingWindow.on('hide', () => updateTrayMenu());
   floatingWindow.on('closed', () => {
     floatingWindow = null;
+    updateTrayMenu();
   });
   loadRenderer(floatingWindow, 'floating');
 }
@@ -427,215 +611,29 @@ function createSettingsWindow() {
   loadRenderer(settingsWindow, 'settings');
 }
 
-function createQuickWindow() {
-  if (quickWindow && !quickWindow.isDestroyed()) return quickWindow;
-
-  quickWindow = new BrowserWindow({
-    width: 156,
-    height: 56,
-    frame: false,
-    transparent: true,
-    backgroundColor: '#00000000',
-    hasShadow: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable: false,
-    minimizable: false,
-    maximizable: false,
-    focusable: false,
-    show: false,
-    type: 'toolbar',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false
-    }
-  });
-
-  quickWindow.setAlwaysOnTop(true, 'screen-saver');
-  applyQuickWindowShape();
-  quickWindow.on('closed', () => {
-    quickWindow = null;
-  });
-  loadRenderer(quickWindow, 'tray');
-  return quickWindow;
-}
-
-function showQuickWindow() {
-  const target = createQuickWindow();
-  const trayBounds = tray && typeof tray.getBounds === 'function' ? tray.getBounds() : null;
-  const cursor = screen.getCursorScreenPoint();
-  const anchor = trayBounds && trayBounds.width && trayBounds.height
-    ? trayBounds
-    : { x: cursor.x, y: cursor.y, width: 1, height: 1 };
-  const display = screen.getDisplayNearestPoint({
-    x: Math.round(anchor.x + anchor.width / 2),
-    y: Math.round(anchor.y + anchor.height / 2)
-  });
-  const workArea = display.workArea;
-  const bounds = target.getBounds();
-  const margin = 10;
-  const x = clamp(
-    Math.round(anchor.x + anchor.width / 2 - bounds.width / 2),
-    workArea.x + margin,
-    workArea.x + workArea.width - bounds.width - margin
-  );
-  const anchorMidY = anchor.y + anchor.height / 2;
-  const y = anchorMidY > workArea.y + workArea.height / 2
-    ? clamp(Math.round(anchor.y - bounds.height - 6), workArea.y + margin, workArea.y + workArea.height - bounds.height - margin)
-    : clamp(Math.round(anchor.y + anchor.height + 6), workArea.y + margin, workArea.y + workArea.height - bounds.height - margin);
-
-  target.setBounds({ x, y, width: bounds.width, height: bounds.height });
-  applyQuickWindowShape();
-  target.showInactive();
-  target.setAlwaysOnTop(true, 'screen-saver');
-  scheduleQuickWindowClose();
-}
-
-function hideQuickWindow() {
-  if (quickWindowCloseTimer) {
-    clearTimeout(quickWindowCloseTimer);
-    quickWindowCloseTimer = null;
-  }
-  if (quickWindow && !quickWindow.isDestroyed()) quickWindow.hide();
-}
-
-function scheduleQuickWindowClose() {
-  if (quickWindowCloseTimer) clearTimeout(quickWindowCloseTimer);
-  quickWindowCloseTimer = setTimeout(() => {
-    quickWindowCloseTimer = null;
-    hideQuickWindow();
-  }, 9000);
-}
-
-function roundedRectShape(width, height, radius) {
-  const rects = [];
-  const safeRadius = Math.max(0, Math.min(radius, Math.floor(width / 2), Math.floor(height / 2)));
-
-  for (let y = 0; y < height; y += 1) {
-    let inset = 0;
-    if (safeRadius > 0 && y < safeRadius) {
-      const distance = safeRadius - y - 0.5;
-      inset = Math.max(0, Math.ceil(safeRadius - Math.sqrt(Math.max(0, safeRadius * safeRadius - distance * distance))));
-    } else if (safeRadius > 0 && y >= height - safeRadius) {
-      const distance = y - (height - safeRadius) + 0.5;
-      inset = Math.max(0, Math.ceil(safeRadius - Math.sqrt(Math.max(0, safeRadius * safeRadius - distance * distance))));
-    }
-
-    rects.push({
-      x: inset,
-      y,
-      width: Math.max(0, width - inset * 2),
-      height: 1
-    });
-  }
-
-  return rects.filter((rect) => rect.width > 0);
-}
-
-function applyQuickWindowShape() {
-  if (!quickWindow || quickWindow.isDestroyed() || typeof quickWindow.setShape !== 'function') return;
-
-  const bounds = quickWindow.getBounds();
-  try {
-    quickWindow.setShape(roundedRectShape(bounds.width, bounds.height, 14));
-  } catch {
-    // Best-effort; the CSS panel still clips the visible shape.
-  }
-}
-
-function resizeFloatingWindow(options = {}) {
+function resizeFloatingWindow() {
   if (!floatingWindow || floatingWindow.isDestroyed()) return;
-  if (options.preserveRightEdge) {
-    const currentBounds = floatingWindow.getBounds();
-    const nextSize = floatingSize();
-    floatingWindow.setBounds({
-      x: Math.round(currentBounds.x + currentBounds.width - nextSize.width),
-      y: currentBounds.y,
-      width: nextSize.width,
-      height: nextSize.height
-    });
-  } else {
-    floatingWindow.setBounds(floatingBounds());
-  }
+  floatingWindow.setBounds(floatingBounds());
+  updateFloatingWindowShape();
   floatingWindow.setAlwaysOnTop(true, 'screen-saver');
-  applyFloatingInputShape();
 }
 
-function applyFloatingInputShape() {
+function updateFloatingWindowShape() {
   if (!floatingWindow || floatingWindow.isDestroyed() || typeof floatingWindow.setShape !== 'function') return;
 
-  const metrics = floatingMetrics();
-  const shellRect = {
-    x: Math.round(metrics.edgePadding + metrics.sideExtraWidth),
-    y: Math.round(metrics.edgePadding),
-    width: Math.round(metrics.shellWidth),
-    height: Math.round(metrics.shellHeight)
-  };
-
-  const rects = [shellRect];
-
+  const expandedSize = floatingSize(true);
   if (sideActionsOpen) {
-    rects.push({
-      x: 0,
-      y: 0,
-      width: Math.round(metrics.edgePadding + metrics.sideExtraWidth),
-      height: Math.round(metrics.height)
-    });
+    floatingWindow.setShape([{ x: 0, y: 0, width: expandedSize.width, height: expandedSize.height }]);
+    return;
   }
 
-  try {
-    floatingWindow.setShape(rects);
-  } catch {
-    // setShape is best-effort; transparent pixels still keep the visual clean.
-  }
-}
-
-function resetFloatingWindowPosition() {
-  if (!floatingWindow || floatingWindow.isDestroyed()) return { ok: false, error: 'Floating window is not available.' };
-
-  floatingWindow.setBounds(floatingBounds(DEFAULT_CONFIG.window.corner));
-  floatingWindow.setAlwaysOnTop(true, 'screen-saver');
-  applyFloatingInputShape();
-  return { ok: true };
-}
-
-function moveFloatingWindowDrag(payload = {}) {
-  if (!floatingWindow || floatingWindow.isDestroyed()) {
-    return { ok: false, error: 'Floating window is not available.' };
-  }
-
-  const startX = Number(payload.startX);
-  const startY = Number(payload.startY);
-  const currentX = Number(payload.currentX);
-  const currentY = Number(payload.currentY);
-
-  if (![startX, startY, currentX, currentY].every(Number.isFinite)) {
-    return { ok: false, error: 'Invalid drag coordinates.' };
-  }
-
-  if (!floatingDragSession) {
-    floatingDragSession = {
-      startX,
-      startY,
-      bounds: floatingWindow.getBounds()
-    };
-  }
-
-  const x = Math.round(floatingDragSession.bounds.x + currentX - floatingDragSession.startX);
-  const y = Math.round(floatingDragSession.bounds.y + currentY - floatingDragSession.startY);
-  floatingWindow.setPosition(x, y, false);
-  return { ok: true };
-}
-
-function endFloatingWindowDrag() {
-  floatingDragSession = null;
-  if (floatingWindow && !floatingWindow.isDestroyed()) {
-    floatingWindow.setAlwaysOnTop(true, 'screen-saver');
-    applyFloatingInputShape();
-  }
-  return { ok: true };
+  const compactSize = floatingSize(false);
+  floatingWindow.setShape([{
+    x: expandedSize.width - compactSize.width,
+    y: 0,
+    width: compactSize.width,
+    height: compactSize.height
+  }]);
 }
 
 function trayIcon() {
@@ -653,13 +651,14 @@ function createTray() {
   tray = new Tray(trayIcon());
   tray.setToolTip('Vibe Shortcut');
   updateTrayMenu();
-  tray.on('click', () => showQuickWindow());
+  tray.on('click', () => showDisplayPresetMenu());
   tray.on('right-click', () => updateTrayMenu());
 }
 
 function updateTrayMenu() {
   if (!tray) return;
   const startup = getStartupState();
+  const floatingVisible = isFloatingWindowVisible();
 
   tray.setContextMenu(Menu.buildFromTemplate([
     {
@@ -668,10 +667,9 @@ function updateTrayMenu() {
     },
     {
       label: '显示悬浮窗',
-      click: () => {
-        if (!floatingWindow || floatingWindow.isDestroyed()) createFloatingWindow();
-        floatingWindow.showInactive();
-      }
+      type: 'checkbox',
+      checked: floatingVisible,
+      click: () => toggleFloatingWindowVisibility()
     },
     {
       label: '开机自启动',
@@ -691,26 +689,85 @@ function updateTrayMenu() {
   ]));
 }
 
-async function applyTabletPresetFromTray(preset = config.tabletPreset) {
-  const result = await applyTabletPreset(preset);
-  const failedStep = result.results.find((step) => !step.ok);
+function isFloatingWindowVisible() {
+  return Boolean(floatingWindow && !floatingWindow.isDestroyed() && floatingWindow.isVisible());
+}
 
-  if (tray && typeof tray.displayBalloon === 'function') {
-    tray.displayBalloon({
-      title: result.ok ? '已应用平板预设' : '平板预设未完全应用',
-      content: result.ok
-        ? '分辨率和方向已提交；缩放比例可能需要注销或重新登录后完全生效。'
-        : failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。'
-    });
-  } else if (!result.ok) {
-    dialog.showErrorBox('平板预设未完全应用', failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。');
+function toggleFloatingWindowVisibility() {
+  if (isFloatingWindowVisible()) {
+    floatingWindow.hide();
+  } else {
+    if (!floatingWindow || floatingWindow.isDestroyed()) createFloatingWindow();
+    floatingWindow.showInactive();
+    floatingWindow.setAlwaysOnTop(true, 'screen-saver');
+  }
+  updateTrayMenu();
+}
+
+function showDisplayPresetMenu() {
+  if (!tray) return;
+  const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
+    ? config.displayPresets
+    : DEFAULT_DISPLAY_PRESETS;
+
+  const menu = Menu.buildFromTemplate([
+    {
+      label: `悬浮窗回到${windowCornerLabel(config.window.corner)}`,
+      click: () => resetFloatingWindowToDefaultPosition()
+    },
+    { type: 'separator' },
+    ...presets.map((preset, index) => ({
+      label: displayPresetMenuLabel(preset, index),
+      type: 'checkbox',
+      checked: preset.id === config.virtualDisplay.lastPresetId,
+      click: () => applyDisplayPresetFromTray(preset)
+    }))
+  ]);
+
+  tray.popUpContextMenu(menu);
+}
+
+function windowCornerLabel(corner) {
+  return {
+    'top-left': '左上角',
+    'top-right': '右上角',
+    'bottom-left': '左下角',
+    'bottom-right': '右下角'
+  }[corner] || '默认位置';
+}
+
+function resetFloatingWindowToDefaultPosition() {
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    createFloatingWindow();
+    return;
   }
 
-  return result;
+  resizeFloatingWindow();
+  floatingWindow.showInactive();
+  floatingWindow.setAlwaysOnTop(true, 'screen-saver');
+}
+
+function scheduleFloatingWindowReset(delay = 800) {
+  clearTimeout(floatingResetTimer);
+  floatingResetTimer = setTimeout(() => {
+    floatingResetTimer = undefined;
+    resetFloatingWindowToDefaultPosition();
+  }, delay);
+}
+
+function displayPresetMenuLabel(preset, index) {
+  const normalized = normalizeDisplayPreset(preset, index);
+  const orientationText = {
+    landscape: '横向',
+    portrait: '纵向',
+    'landscape-flipped': '横向翻转',
+    'portrait-flipped': '纵向翻转'
+  }[normalized.orientation] || normalized.orientation;
+  return `${normalized.label} · ${orientationText} · 跟随系统`;
 }
 
 function broadcastConfig() {
-  for (const target of [floatingWindow, settingsWindow, quickWindow]) {
+  for (const target of [floatingWindow, settingsWindow]) {
     if (target && !target.isDestroyed()) {
       target.webContents.send('config:changed', config);
     }
@@ -779,117 +836,17 @@ function shortcutToSendKeys(shortcut) {
   return `${prefix}{${key.toUpperCase()}}`;
 }
 
-function shortcutNeedsNativeSender(shortcut) {
-  const parts = String(shortcut || '')
-    .split('+')
-    .map((part) => part.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (!parts.length) return false;
-  return parts.some((part) => ['win', 'meta', 'cmd'].includes(part)) || parts.every(isModifierPart);
-}
-
-function isModifierPart(value) {
-  return ['ctrl', 'control', 'shift', 'alt', 'option', 'win', 'meta', 'cmd'].includes(value);
-}
-
-function shortcutToNativeEvents(shortcut) {
-  const parts = String(shortcut || '')
-    .split('+')
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  const modifiers = [];
-  let key = null;
-
-  for (const part of parts) {
-    const normalized = part.toLowerCase();
-    if (normalized === 'ctrl' || normalized === 'control') modifiers.push({ name: 'Ctrl', vk: 0x11 });
-    else if (normalized === 'shift') modifiers.push({ name: 'Shift', vk: 0x10 });
-    else if (normalized === 'alt' || normalized === 'option') modifiers.push({ name: 'Alt', vk: 0x12 });
-    else if (normalized === 'win' || normalized === 'meta' || normalized === 'cmd') modifiers.push({ name: 'Win', vk: 0x5b });
-    else key = part;
-  }
-
-  const events = [];
-  const uniqueModifiers = [];
-  for (const modifier of modifiers) {
-    if (!uniqueModifiers.some((item) => item.vk === modifier.vk)) uniqueModifiers.push(modifier);
-  }
-
-  for (const modifier of uniqueModifiers) events.push(keyEvent(modifier.vk, false));
-
-  if (key) {
-    const keyVk = keyToVirtualKey(key);
-    if (!keyVk) throw new Error(`Native sender does not support ${key}.`);
-    events.push(keyEvent(keyVk, false));
-    events.push(keyEvent(keyVk, true));
-  }
-
-  for (const modifier of [...uniqueModifiers].reverse()) events.push(keyEvent(modifier.vk, true));
-  return events;
-}
-
-function keyEvent(vk, up) {
-  return { vk, up, extended: isExtendedVirtualKey(vk) };
-}
-
-function keyToVirtualKey(key) {
-  const normalized = key.toLowerCase();
-  const special = {
-    enter: 0x0d,
-    return: 0x0d,
-    backspace: 0x08,
-    delete: 0x2e,
-    del: 0x2e,
-    esc: 0x1b,
-    escape: 0x1b,
-    tab: 0x09,
-    space: 0x20,
-    up: 0x26,
-    arrowup: 0x26,
-    down: 0x28,
-    arrowdown: 0x28,
-    left: 0x25,
-    arrowleft: 0x25,
-    right: 0x27,
-    arrowright: 0x27,
-    home: 0x24,
-    end: 0x23,
-    pageup: 0x21,
-    pagedown: 0x22,
-    insert: 0x2d
-  };
-
-  if (special[normalized]) return special[normalized];
-  if (/^f([1-9]|1[0-9]|2[0-4])$/i.test(key)) return 0x70 + Number(key.slice(1)) - 1;
-  if (/^[a-z]$/i.test(key)) return key.toUpperCase().charCodeAt(0);
-  if (/^[0-9]$/.test(key)) return key.charCodeAt(0);
-  return null;
-}
-
-function isExtendedVirtualKey(vk) {
-  return new Set([
-    0x21, // PageUp
-    0x22, // PageDown
-    0x23, // End
-    0x24, // Home
-    0x25, // Left
-    0x26, // Up
-    0x27, // Right
-    0x28, // Down
-    0x2d, // Insert
-    0x2e, // Delete
-    0x5b // Left Windows
-  ]).has(vk);
-}
-
 function inputSenderScript() {
   return `
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @'
 using System;
+using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
 public static class NativeInput {
   [StructLayout(LayoutKind.Sequential)] public struct INPUT { public UInt32 type; public INPUTUNION u; }
   [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
@@ -908,6 +865,21 @@ public static class NativeInput {
   }
   [DllImport("user32.dll", SetLastError=true)] public static extern UInt32 SendInput(UInt32 nInputs, INPUT[] pInputs, Int32 cbSize);
   [DllImport("user32.dll")] public static extern UInt32 MapVirtualKey(UInt32 uCode, UInt32 uMapType);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern UInt32 GetWindowThreadProcessId(IntPtr hWnd, out UInt32 processId);
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(UInt32 idAttach, UInt32 idAttachTo, bool attach);
+  [DllImport("kernel32.dll")] static extern UInt32 GetCurrentThreadId();
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr LoadLibraryW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate UInt32 RpcFocus(IntPtr context);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate UInt32 RpcSimpleMessage(IntPtr context, UInt32 message, UInt32 param1, UInt32 param2);
+  static IntPtr doubaoRpcModule;
+  static RpcFocus doubaoFocusIn;
+  static RpcFocus doubaoFocusOut;
+  static RpcSimpleMessage doubaoSimpleMessage;
   public static void SendChar(UInt16 scan, bool keyUp) {
     INPUT[] inputs = new INPUT[1];
     inputs[0].type = 1;
@@ -930,8 +902,89 @@ public static class NativeInput {
     UInt32 sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     if (sent == 0) throw new InvalidOperationException("SendInput failed " + Marshal.GetLastWin32Error());
   }
+  static T LoadExport<T>(string name) where T : class {
+    IntPtr address = GetProcAddress(doubaoRpcModule, name);
+    if (address == IntPtr.Zero) throw new InvalidOperationException("Doubao RPC export is missing: " + name);
+    return Marshal.GetDelegateForFunctionPointer(address, typeof(T)) as T;
+  }
+  static void EnsureDoubaoRpc(string rpcPath) {
+    if (doubaoRpcModule != IntPtr.Zero) return;
+    doubaoRpcModule = LoadLibraryW(rpcPath);
+    if (doubaoRpcModule == IntPtr.Zero) {
+      throw new InvalidOperationException("Unable to load Doubao RPC library " + Marshal.GetLastWin32Error());
+    }
+    doubaoFocusIn = LoadExport<RpcFocus>("RpcPipe_FocusIn");
+    doubaoFocusOut = LoadExport<RpcFocus>("RpcPipe_FocusOut");
+    doubaoSimpleMessage = LoadExport<RpcSimpleMessage>("RpcPipe_SimpleMessage");
+  }
+  static void MakeForeground(IntPtr target, bool setFocus) {
+    UInt32 processId;
+    UInt32 currentThread = GetCurrentThreadId();
+    UInt32 foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), out processId);
+    UInt32 targetThread = GetWindowThreadProcessId(target, out processId);
+    bool attachedForeground = foregroundThread != 0
+      && foregroundThread != currentThread
+      && AttachThreadInput(currentThread, foregroundThread, true);
+    bool attachedTarget = targetThread != 0
+      && targetThread != currentThread
+      && targetThread != foregroundThread
+      && AttachThreadInput(currentThread, targetThread, true);
+
+    try {
+      BringWindowToTop(target);
+      SetForegroundWindow(target);
+      if (setFocus) SetFocus(target);
+    } finally {
+      if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+      if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+    }
+  }
+  public static void ToggleDoubaoVoice(string rpcPath, string pipeName) {
+    EnsureDoubaoRpc(rpcPath);
+    IntPtr previousForeground = GetForegroundWindow();
+    IntPtr rpcContext = Marshal.StringToHGlobalAnsi(pipeName);
+    Form focusWindow = new Form();
+    bool focusRegistered = false;
+
+    try {
+      focusWindow.FormBorderStyle = FormBorderStyle.None;
+      focusWindow.ShowInTaskbar = false;
+      focusWindow.StartPosition = FormStartPosition.Manual;
+      focusWindow.Location = new Point(-32000, -32000);
+      focusWindow.Size = new Size(1, 1);
+      focusWindow.Opacity = 0.01;
+      focusWindow.Show();
+      focusWindow.Activate();
+      Application.DoEvents();
+      MakeForeground(focusWindow.Handle, true);
+
+      for (int attempt = 0; attempt < 5 && GetForegroundWindow() != focusWindow.Handle; attempt++) {
+        Application.DoEvents();
+        Thread.Sleep(10);
+        MakeForeground(focusWindow.Handle, true);
+      }
+      if (GetForegroundWindow() != focusWindow.Handle) {
+        throw new InvalidOperationException("Unable to acquire temporary foreground focus for Doubao voice input.");
+      }
+
+      Thread.Sleep(30);
+      doubaoFocusIn(rpcContext);
+      focusRegistered = true;
+      doubaoSimpleMessage(rpcContext, 0x3e9, 0, 0);
+      Thread.Sleep(120);
+    } finally {
+      if (focusRegistered) doubaoFocusOut(rpcContext);
+      if (previousForeground != IntPtr.Zero) {
+        MakeForeground(previousForeground, false);
+        Application.DoEvents();
+      }
+      focusWindow.Hide();
+      focusWindow.Dispose();
+      Marshal.FreeHGlobal(rpcContext);
+    }
+  }
 }
-'@
+'@ -ReferencedAssemblies System.Windows.Forms,System.Drawing
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
   $id = ''
@@ -949,6 +1002,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         Start-Sleep -Milliseconds 8
       } elseif ($action.type -eq 'sleep') {
         Start-Sleep -Milliseconds ([int]$action.ms)
+      } elseif ($action.type -eq 'doubaoVoice') {
+        [NativeInput]::ToggleDoubaoVoice([string]$action.rpcPath, [string]$action.pipeName)
       }
     }
     [pscustomobject]@{ id = $id; ok = $true } | ConvertTo-Json -Compress
@@ -1072,14 +1127,6 @@ function nativeEventsToInputActions(events) {
   });
 }
 
-function textToInputActions(text) {
-  const actions = [];
-  for (let index = 0; index < text.length; index += 1) {
-    actions.push({ type: 'char', scan: text.charCodeAt(index) });
-  }
-  return actions;
-}
-
 function sendNativeEvents(events) {
   if (!events.length) return Promise.resolve({ ok: false, error: 'Shortcut is empty.' });
   return sendInputActions(nativeEventsToInputActions(events));
@@ -1094,6 +1141,26 @@ function sendNativeShortcut(shortcut) {
   }
 
   return sendNativeEvents(events);
+}
+
+function findDoubaoRpcPath() {
+  const roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean);
+  for (const root of roots) {
+    const candidate = path.join(root, 'DoubaoIME', 'rpc.dll');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return '';
+}
+
+function sendDoubaoVoiceShortcut(shortcut, context) {
+  if (!isDoubaoVoiceShortcut(shortcut, context)) return null;
+  const rpcPath = findDoubaoRpcPath();
+  if (!rpcPath) return Promise.resolve({ ok: false, error: 'Doubao IME RPC library was not found.' });
+  return sendInputActions([{
+    type: 'doubaoVoice',
+    rpcPath,
+    pipeName: '\\\\.\\pipe\\ObricIme\\oime-server'
+  }]);
 }
 
 function sendNativeShortcutSequence(shortcuts) {
@@ -1177,7 +1244,10 @@ function escapeSendKeysChar(value) {
   return value.replace(/[+^%~()[\]{}]/g, '{$&}');
 }
 
-function sendShortcut(shortcut) {
+function sendShortcut(shortcut, context) {
+  const doubaoResult = sendDoubaoVoiceShortcut(shortcut, context);
+  if (doubaoResult) return doubaoResult;
+
   return sendNativeShortcut(shortcut).then((nativeResult) => {
     if (nativeResult.ok || shortcutNeedsNativeSender(shortcut)) return nativeResult;
 
@@ -1219,113 +1289,503 @@ async function sendShortcutSequence(shortcuts) {
   return { ok: true };
 }
 
-function runPowerShell(command) {
-  return new Promise((resolve) => {
-    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
-      windowsHide: true
-    });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('error', (error) => {
-      resolve({ ok: false, error: error.message });
-    });
-    child.on('exit', (code) => {
-      resolve(code === 0
-        ? { ok: true, output: stdout.trim() }
-        : { ok: false, error: stderr.trim() || stdout.trim() || `PowerShell exited with code ${code}` });
-    });
+async function applyDisplayPresetFromTray(preset) {
+  const intentRevision = beginVirtualDisplayIntent();
+  const normalized = rememberVirtualDisplayPreset(preset, {
+    preserveVirtualDisplayIntent: true
   });
+  const result = await applyDisplayPreset(normalized, { intentRevision });
+  if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return result;
+  const failedStep = [...result.results].reverse().find((step) => !step.ok);
+  const waitingForConnection = !result.ok && failedStep?.step === 'detect' && !failedStep.connected;
+  const appliedPreset = result.preset || normalized;
+  const appliedDimensions = effectiveDisplayDimensions(appliedPreset);
+
+  if (result.ok && config.remoteAutomation.resetFloatingWindow) {
+    scheduleFloatingWindowReset(800);
+  }
+
+  if (tray && typeof tray.displayBalloon === 'function') {
+    tray.displayBalloon({
+      title: waitingForConnection ? 'UU 虚拟屏未连接' : (result.ok ? '已切换 UU 虚拟屏方向' : 'UU 虚拟屏方向切换失败'),
+      content: waitingForConnection
+        ? '连接 UU 虚拟屏后，请再次点击该方向。'
+        : result.ok
+          ? `${appliedDimensions.width} × ${appliedDimensions.height}，沿用系统当前像素尺寸与缩放。`
+          : failedStep?.error || '请检查当前虚拟屏是否支持该方向。'
+    });
+  } else if (!result.ok && !waitingForConnection) {
+    dialog.showErrorBox('UU 虚拟屏方向切换失败', failedStep?.error || '请检查当前虚拟屏是否支持该方向。');
+  }
+
+  return result;
 }
 
-async function applyTabletPreset(preset) {
-  const normalized = mergeTabletPreset(preset);
-  const results = [];
+function rememberVirtualDisplayPreset(preset, saveOptions = {}) {
+  const normalized = normalizeDisplayPreset(preset);
+  const nextConfig = {
+    ...config,
+    virtualDisplay: {
+      ...config.virtualDisplay,
+      lastOrientation: normalized.orientation,
+      lastPresetId: normalized.id
+    }
+  };
+  saveConfig(nextConfig, {
+    preserveFloatingBounds: true,
+    ...saveOptions
+  });
+  return config.displayPresets.find((item) => item.id === normalized.id) || normalized;
+}
 
-  const displayResult = await applyDisplayMode(normalized);
-  results.push({ step: 'display', ...displayResult });
-  resizeFloatingWindow();
+function beginVirtualDisplayIntent() {
+  return virtualDisplayIntent.begin();
+}
 
-  const scaleResult = await applyDisplayScale(normalized.scale);
-  results.push({ step: 'scale', ...scaleResult, needsSignOut: true });
+function applyDisplayPreset(preset, options = {}) {
+  const intentRevision = Number.isInteger(options.intentRevision)
+    ? options.intentRevision
+    : virtualDisplayIntent.current();
+  return virtualDisplayIntent.enqueue(
+    intentRevision,
+    () => applyDisplayPresetNow(preset, { ...options, intentRevision })
+  );
+}
+
+async function applyDisplayPresetNow(preset, options = {}) {
+  const normalized = normalizeDisplayPreset(preset);
+  const status = options.sourceStatus || await readVirtualDisplayStatus();
+  if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
+    return { ok: false, stale: true, results: [] };
+  }
+  if (!status.connected) {
+    return {
+      ok: false,
+      preset: normalized,
+      candidateIndex: 0,
+      results: [{
+        ...status,
+        ok: false,
+        step: 'detect',
+        error: status.error || 'UU 虚拟屏未连接，请连接后再选择方向。'
+      }]
+    };
+  }
+
+  const orientationProfile = createOrientationDisplayProfile(normalized, status);
+  if (!orientationProfile) {
+    return {
+      ok: false,
+      preset: normalized,
+      candidateIndex: 0,
+      results: [{
+        ...status,
+        ok: false,
+        step: 'display',
+        error: '无法从 UU 虚拟屏读取当前设备的有效分辨率。'
+      }]
+    };
+  }
+
+  const displayResult = rememberVirtualDisplayStatus(
+    await applyVirtualDisplayProfile(orientationProfile, config.virtualDisplay.adapterName)
+  );
+  return {
+    ok: displayResult.ok,
+    preset: orientationProfile,
+    candidateIndex: 0,
+    results: [{
+      ...displayResult,
+      profile: orientationProfile,
+      candidateIndex: 0
+    }]
+  };
+}
+
+function effectiveDisplayDimensions(preset) {
+  const portrait = ['portrait', 'portrait-flipped'].includes(preset.orientation);
+  return {
+    width: portrait ? preset.height : preset.width,
+    height: portrait ? preset.width : preset.height
+  };
+}
+
+function rememberVirtualDisplayStatus(status) {
+  if (status?.connected) {
+    virtualDisplayNativeOrigin = {
+      x: Number(status.positionX) || 0,
+      y: Number(status.positionY) || 0
+    };
+  } else if (status?.step === 'detect') {
+    virtualDisplayNativeOrigin = undefined;
+  }
+  return status;
+}
+
+async function readVirtualDisplayStatus() {
+  return rememberVirtualDisplayStatus(
+    await getVirtualDisplayStatus(config.virtualDisplay.adapterName)
+  );
+}
+
+async function waitForConnectedVirtualDisplay(isCurrent) {
+  let status;
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    if (!isCurrent()) return { ok: false, stale: true, step: 'scale-refresh' };
+    status = await readVirtualDisplayStatus();
+    if (status.connected && status.deviceName) return status;
+    if (attempt < 6) await delay(300);
+  }
+  return status || {
+    ok: false,
+    connected: false,
+    step: 'detect',
+    error: 'UU 会话已连接，但尚未检测到虚拟屏。'
+  };
+}
+
+async function readUuTargetScale(status, isCurrent) {
+  let cacheResult;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (!isCurrent()) return { ok: false, stale: true, step: 'scale-config' };
+    cacheResult = readGameViewerConfiguredScale(status.deviceName);
+    if (cacheResult.ok) {
+      return { ...cacheResult, source: 'uu-cache' };
+    }
+    if (attempt < 3) await delay(250);
+  }
+
+  if (!isCurrent()) return { ok: false, stale: true, step: 'scale-config' };
+  const displayResult = await getVirtualDisplayConfiguredScale(config.virtualDisplay.adapterName);
+  if (!displayResult.ok) return cacheResult || displayResult;
+  return {
+    ...displayResult,
+    source: 'display-config',
+    scale: displayResult.scale
+  };
+}
+
+async function refreshUuVirtualDisplayScale(sessionRevision) {
+  const isCurrent = () => (
+    gameViewerSessionConnected === true
+    && sessionRevision === gameViewerSessionRevision
+  );
+  const status = await waitForConnectedVirtualDisplay(isCurrent);
+  if (!status.connected || status.stale) return status;
+
+  const target = await readUuTargetScale(status, isCurrent);
+  if (!target.ok || target.stale || !isCurrent()) return target;
+
+  logDisplayAutomation('scale-target', {
+    sessionRevision,
+    deviceName: status.deviceName,
+    width: status.width,
+    height: status.height,
+    targetScale: target.scale,
+    source: target.source
+  });
+
+  // UU finishes its display/capture initialization after Windows announces the
+  // monitor. Applying before that point only changes the scale briefly.
+  await delay(UU_SCALE_SETTLE_DELAY_MS);
+  if (!isCurrent()) return { ok: false, stale: true, step: 'scale-settle' };
+
+  const firstResult = rememberVirtualDisplayStatus(
+    await reapplyVirtualDisplayScale(target.scale, config.virtualDisplay.adapterName)
+  );
+  logDisplayAutomation('scale-reapply', {
+    sessionRevision,
+    attempt: 1,
+    targetScale: target.scale,
+    result: firstResult
+  });
+  if (!firstResult.ok || !isCurrent()) {
+    return {
+      ...firstResult,
+      requestedScale: target.scale,
+      scaleSource: target.source
+    };
+  }
+
+  await delay(UU_SCALE_VERIFY_DELAY_MS);
+  if (!isCurrent()) return { ok: false, stale: true, step: 'scale-verify' };
+
+  let effectiveResult = await getVirtualDisplayEffectiveScale(config.virtualDisplay.adapterName);
+  logDisplayAutomation('scale-effective-verify', {
+    sessionRevision,
+    attempt: 1,
+    targetScale: target.scale,
+    result: effectiveResult
+  });
+
+  let result = firstResult;
+  if (!effectiveResult.ok || effectiveResult.scale !== target.scale) {
+    result = rememberVirtualDisplayStatus(
+      await reapplyVirtualDisplayScale(target.scale, config.virtualDisplay.adapterName)
+    );
+    logDisplayAutomation('scale-reapply', {
+      sessionRevision,
+      attempt: 2,
+      targetScale: target.scale,
+      result
+    });
+    if (!result.ok || !isCurrent()) {
+      return {
+        ...result,
+        requestedScale: target.scale,
+        scaleSource: target.source
+      };
+    }
+
+    await delay(450);
+    if (!isCurrent()) return { ok: false, stale: true, step: 'scale-verify' };
+    effectiveResult = await getVirtualDisplayEffectiveScale(config.virtualDisplay.adapterName);
+    logDisplayAutomation('scale-effective-verify', {
+      sessionRevision,
+      attempt: 2,
+      targetScale: target.scale,
+      result: effectiveResult
+    });
+  }
+
+  if (!effectiveResult.ok || effectiveResult.scale !== target.scale) {
+    return {
+      ...effectiveResult,
+      ok: false,
+      step: 'effective-scale-verify',
+      error: effectiveResult.error || `UU 虚拟屏实际缩放未保持为 ${target.scale}%。`,
+      requestedScale: target.scale,
+      scaleSource: target.source
+    };
+  }
 
   return {
-    ok: results.every((result) => result.ok),
-    preset: normalized,
-    results
+    ...result,
+    effectiveScale: effectiveResult.scale,
+    requestedScale: target.scale,
+    scaleSource: target.source
   };
 }
 
-function applyDisplayMode(preset) {
-  const orientationCodes = {
-    landscape: 0,
-    portrait: 1,
-    'landscape-flipped': 2,
-    'portrait-flipped': 3
-  };
-  const orientation = orientationCodes[preset.orientation] ?? 1;
-  const width = Number(preset.width) || 0;
-  const height = Number(preset.height) || 0;
-  const typeDefinition = [
-    'using System;',
-    'using System.Runtime.InteropServices;',
-    'public static class DisplaySettings {',
-    '  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]',
-    '  public struct DEVMODE {',
-    '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;',
-    '    public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;',
-    '    public int dmFields;',
-    '    public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;',
-    '    public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;',
-    '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;',
-    '    public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;',
-    '    public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent;',
-    '    public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2;',
-    '    public int dmPanningWidth; public int dmPanningHeight;',
-    '  }',
-    '  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);',
-    '  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettingsEx(string deviceName, ref DEVMODE devMode, IntPtr hwnd, int flags, IntPtr lParam);',
-    '  public static int Apply(int width, int height, int orientation) {',
-    '    DEVMODE mode = new DEVMODE();',
-    '    mode.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));',
-    '    EnumDisplaySettings(null, -1, ref mode);',
-    '    int nextWidth = width > 0 && height > 0 ? width : mode.dmPelsWidth;',
-    '    int nextHeight = width > 0 && height > 0 ? height : mode.dmPelsHeight;',
-    '    if (!(width > 0 && height > 0) && ((mode.dmDisplayOrientation % 2) != (orientation % 2))) { int swap = nextWidth; nextWidth = nextHeight; nextHeight = swap; }',
-    '    mode.dmFields = 0x80 | 0x80000 | 0x100000;',
-    '    mode.dmDisplayOrientation = orientation;',
-    '    mode.dmPelsWidth = nextWidth;',
-    '    mode.dmPelsHeight = nextHeight;',
-    '    return ChangeDisplaySettingsEx(null, ref mode, IntPtr.Zero, 0, IntPtr.Zero);',
-    '  }',
-    '}'
-  ].join(' ');
-  const encodedType = Buffer.from(typeDefinition, 'utf16le').toString('base64');
-  const command = [
-    `$type = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedType}'))`,
-    'Add-Type -TypeDefinition $type',
-    `$result = [DisplaySettings]::Apply(${width}, ${height}, ${orientation})`,
-    'if ($result -ne 0) { throw "ChangeDisplaySettingsEx returned $result" }'
-  ].join('; ');
-
-  return runPowerShell(command);
+function notifyScaleRefreshFailure(result) {
+  if (!result || result.stale || !gameViewerSessionConnected) return;
+  const message = result.error || '无法读取或重新应用 UU 虚拟屏的缩放配置。';
+  if (tray && typeof tray.displayBalloon === 'function') {
+    tray.displayBalloon({
+      title: 'UU 虚拟屏缩放刷新失败',
+      content: message
+    });
+  }
 }
 
-function applyDisplayScale(scale) {
-  const dpi = Math.round(96 * clamp(Number(scale) || DEFAULT_TABLET_PRESET.scale, 100, 350) / 100);
+async function applyRemoteSessionAutomation(connected, options = {}) {
+  const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
+  const sessionRevision = options.sessionRevision ?? gameViewerSessionRevision;
+
+  if (sessionRevision !== gameViewerSessionRevision) return;
+
+  if (connected) {
+    const result = automation.refreshVirtualDisplayScale
+      ? await refreshUuVirtualDisplayScale(sessionRevision)
+      : await readVirtualDisplayStatus();
+    if (automation.refreshVirtualDisplayScale && !result.ok) {
+      notifyScaleRefreshFailure(result);
+    }
+  } else {
+    virtualDisplayNativeOrigin = undefined;
+  }
+
+  if (sessionRevision !== gameViewerSessionRevision) return;
+  if ((options.connectionChanged || options.entrySync) && automation.resetFloatingWindow) {
+    scheduleFloatingWindowReset(800);
+  }
+}
+
+function scheduleGameViewerSessionAutomation(connected, options = {}) {
+  const connectionChanged = gameViewerSessionConnected !== connected;
+  gameViewerSessionConnected = connected;
+  gameViewerSessionRevision += 1;
+  const sessionRevision = gameViewerSessionRevision;
+  clearTimeout(gameViewerSessionAutomationTimer);
+  beginVirtualDisplayIntent();
+  logDisplayAutomation('session-scheduled', {
+    connected,
+    connectionChanged,
+    reason: options.reason || 'session-event',
+    sessionRevision
+  });
+  gameViewerSessionAutomationTimer = setTimeout(() => {
+    gameViewerSessionAutomationTimer = undefined;
+    applyRemoteSessionAutomation(connected, {
+      connectionChanged,
+      entrySync: options.entrySync ?? (connectionChanged && connected),
+      sessionRevision
+    }).catch(() => undefined);
+  }, connected ? 700 : 250);
+}
+
+function registerGameViewerSessionAutomation() {
+  gameViewerSessionWatcher = new GameViewerSessionWatcher({
+    onSessionChanged: ({ connected }) => scheduleGameViewerSessionAutomation(connected, {
+      reason: 'uu-session-log'
+    })
+  }).start();
+}
+
+function scheduleVirtualDisplayConnectionSync(options = {}) {
+  const revision = virtualDisplayConnectionSyncRevision + 1;
+  virtualDisplayConnectionSyncRevision = revision;
+  clearTimeout(virtualDisplayConnectionSyncTimer);
+  virtualDisplayConnectionSyncTimer = setTimeout(async () => {
+    virtualDisplayConnectionSyncTimer = undefined;
+    let status;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (revision !== virtualDisplayConnectionSyncRevision) return;
+      status = await getVirtualDisplayStatus(config.virtualDisplay.adapterName);
+      if (status.connected) break;
+      if (attempt < 3) await delay(250);
+    }
+
+    if (revision !== virtualDisplayConnectionSyncRevision || !status) return;
+    if (status.connected) {
+      rememberVirtualDisplayStatus(status);
+      if (gameViewerSessionConnected !== true) {
+        scheduleGameViewerSessionAutomation(true, {
+          reason: options.reason || 'display-connected'
+        });
+        return;
+      }
+
+      if (options.checkScale && config.remoteAutomation?.refreshVirtualDisplayScale) {
+        const [configuredScale, effectiveScale] = await Promise.all([
+          getVirtualDisplayConfiguredScale(config.virtualDisplay.adapterName),
+          getVirtualDisplayEffectiveScale(config.virtualDisplay.adapterName)
+        ]);
+        if (revision !== virtualDisplayConnectionSyncRevision) return;
+
+        logDisplayAutomation('topology-scale-check', {
+          reason: options.reason || 'display-event',
+          deviceName: status.deviceName,
+          configuredScale: configuredScale.scale,
+          effectiveScale: effectiveScale.scale,
+          configuredOk: configuredScale.ok,
+          effectiveOk: effectiveScale.ok
+        });
+
+        if (
+          configuredScale.ok
+          && effectiveScale.ok
+          && configuredScale.scale !== effectiveScale.scale
+        ) {
+          scheduleGameViewerSessionAutomation(true, {
+            entrySync: false,
+            reason: 'effective-scale-mismatch'
+          });
+        }
+      }
+      return;
+    }
+
+    if (gameViewerSessionConnected === true) {
+      scheduleGameViewerSessionAutomation(false, {
+        reason: options.reason || 'display-disconnected'
+      });
+    }
+  }, Number(options.delay) || 500);
+}
+
+function registerVirtualDisplayConnectionEvents() {
+  displayAddedHandler = (_event, display) => {
+    logDisplayAutomation('display-added', { display });
+    scheduleVirtualDisplayConnectionSync({
+      checkScale: true,
+      delay: 500,
+      reason: 'display-added'
+    });
+  };
+  displayRemovedHandler = (_event, display) => {
+    logDisplayAutomation('display-removed', { display });
+    scheduleVirtualDisplayConnectionSync({
+      checkScale: true,
+      delay: 500,
+      reason: 'display-removed'
+    });
+  };
+  displayMetricsChangedHandler = (_event, display, changedMetrics) => {
+    logDisplayAutomation('display-metrics-changed', { display, changedMetrics });
+    scheduleVirtualDisplayConnectionSync({
+      checkScale: true,
+      delay: 500,
+      reason: 'display-metrics-changed'
+    });
+  };
+  screen.on('display-added', displayAddedHandler);
+  screen.on('display-removed', displayRemovedHandler);
+  screen.on('display-metrics-changed', displayMetricsChangedHandler);
+
+  // A one-time startup sync covers launching Vibe Shortcut during an active UU session.
+  scheduleVirtualDisplayConnectionSync({
+    checkScale: true,
+    delay: 500
+  });
+  logDisplayAutomation('startup-sync-scheduled');
+}
+
+function unregisterVirtualDisplayConnectionEvents() {
+  clearTimeout(virtualDisplayConnectionSyncTimer);
+  virtualDisplayConnectionSyncTimer = undefined;
+  virtualDisplayConnectionSyncRevision += 1;
+  if (displayAddedHandler) screen.removeListener('display-added', displayAddedHandler);
+  if (displayRemovedHandler) screen.removeListener('display-removed', displayRemovedHandler);
+  if (displayMetricsChangedHandler) screen.removeListener('display-metrics-changed', displayMetricsChangedHandler);
+  displayAddedHandler = undefined;
+  displayRemovedHandler = undefined;
+  displayMetricsChangedHandler = undefined;
+}
+
+function startRepeatShortcut(shortcut) {
+  stopRepeatShortcut();
+
+  let sendKeys;
+  try {
+    sendKeys = shortcutToSendKeys(shortcut);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
+  if (!sendKeys) return { ok: false, error: 'Shortcut is empty.' };
+
+  const escaped = sendKeys.replace(/'/g, "''");
   const command = [
-    `Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name Win8DpiScaling -Type DWord -Value 1`,
-    `Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name LogPixels -Type DWord -Value ${dpi}`,
-    'Start-Process -FilePath rundll32.exe -ArgumentList "user32.dll,UpdatePerUserSystemParameters" -WindowStyle Hidden'
+    'Add-Type -AssemblyName System.Windows.Forms',
+    `while ($true) { [System.Windows.Forms.SendKeys]::SendWait('${escaped}'); Start-Sleep -Milliseconds 72 }`
   ].join('; ');
 
-  return runPowerShell(command);
+  repeatProcess = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    windowsHide: true
+  });
+
+  repeatProcess.on('exit', () => {
+    repeatProcess = null;
+  });
+  repeatProcess.on('error', () => {
+    repeatProcess = null;
+  });
+
+  return { ok: true };
+}
+
+function stopRepeatShortcut() {
+  if (repeatProcess && !repeatProcess.killed) {
+    try {
+      repeatProcess.kill();
+    } catch {
+      // Best effort: the process only exists while a repeat key is held.
+    }
+  }
+  repeatProcess = null;
+  return { ok: true };
 }
 
 function setSideActionsOpen(nextOpen) {
@@ -1333,7 +1793,7 @@ function setSideActionsOpen(nextOpen) {
   if (sideActionsOpen === open) return { ok: true, open: sideActionsOpen };
 
   sideActionsOpen = open;
-  applyFloatingInputShape();
+  updateFloatingWindowShape();
   return { ok: true, open: sideActionsOpen };
 }
 
@@ -1376,19 +1836,33 @@ function broadcastStartup(state = getStartupState()) {
 
 function registerIpc() {
   ipcMain.handle('config:get', () => config);
-  ipcMain.handle('config:save', (_event, nextConfig) => saveConfig(nextConfig));
-  ipcMain.handle('shortcut:send', (_event, shortcut) => sendShortcut(shortcut));
+  ipcMain.handle('config:save', (_event, nextConfig, options) => saveConfig(nextConfig, options));
+  ipcMain.handle('shortcut:send', async (_event, shortcut, context) => {
+    let result;
+    try {
+      result = await sendShortcut(shortcut, context);
+    } catch (error) {
+      result = { ok: false, error: error.message };
+    }
+    if (context?.kind === 'voice') {
+      try {
+        fs.appendFileSync(path.join(app.getPath('userData'), 'voice-input.log'),
+          `${new Date().toISOString()} ${JSON.stringify({ shortcut, modeId: context.modeId, label: context.label, ...result })}\n`, 'utf8');
+      } catch {
+        // Diagnostics must not interrupt input.
+      }
+      if (!result.ok && tray && typeof tray.displayBalloon === 'function') {
+        tray.displayBalloon({ title: '语音输入启动失败', content: result.error || '请检查当前语音模式及输入法。' });
+      }
+    }
+    return result;
+  });
   ipcMain.handle('shortcut:sendSequence', (_event, shortcuts) => sendShortcutSequence(shortcuts));
   ipcMain.handle('text:send', (_event, text, afterShortcut) => sendText(text, afterShortcut));
-  ipcMain.handle('display:applyTabletPreset', (_event, preset) => applyTabletPresetFromTray(preset));
+  ipcMain.handle('text:insert', (_event, text, afterShortcut) => sendText(text, afterShortcut));
+  ipcMain.handle('shortcut:startRepeat', (_event, shortcut) => startRepeatShortcut(shortcut));
+  ipcMain.handle('shortcut:stopRepeat', () => stopRepeatShortcut());
   ipcMain.handle('floating:setSideActionsOpen', (_event, open) => setSideActionsOpen(open));
-  ipcMain.handle('floating:resetPosition', () => resetFloatingWindowPosition());
-  ipcMain.handle('floating:moveDrag', (_event, payload) => moveFloatingWindowDrag(payload));
-  ipcMain.handle('floating:endDrag', () => endFloatingWindowDrag());
-  ipcMain.handle('trayQuick:close', () => {
-    hideQuickWindow();
-    return { ok: true };
-  });
   ipcMain.handle('startup:get', () => getStartupState());
   ipcMain.handle('startup:set', (_event, enabled) => {
     const state = setStartupEnabled(enabled);
@@ -1425,6 +1899,11 @@ if (!gotSingleInstanceLock) {
       floatingWindow.showInactive();
       floatingWindow.setAlwaysOnTop(true, 'screen-saver');
     }
+
+    if (!config) return;
+    if (config.remoteAutomation.resetFloatingWindow) {
+      scheduleFloatingWindowReset(100);
+    }
   });
 
   app.whenReady().then(() => {
@@ -1434,20 +1913,23 @@ if (!gotSingleInstanceLock) {
     createFloatingWindow();
     createTray();
     ensureInputSender();
-
-    screen.on('display-metrics-changed', () => resizeFloatingWindow());
+    registerGameViewerSessionAutomation();
+    registerVirtualDisplayConnectionEvents();
 
     app.on('activate', () => {
       if (!floatingWindow) createFloatingWindow();
     });
   });
 
-  app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit();
-  });
-
   app.on('before-quit', () => {
+    clearTimeout(gameViewerSessionAutomationTimer);
+    clearTimeout(floatingResetTimer);
+    gameViewerSessionWatcher?.dispose();
+    unregisterVirtualDisplayConnectionEvents();
     stopInputSender();
   });
 
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
 }

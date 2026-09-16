@@ -1,6 +1,6 @@
 {
   "name": "vibe-shortcut",
-  "version": "0.1.0",
+  "version": "0.2.13",
   "private": true,
   "description": "A frosted-glass floating shortcut panel for touch-first desktop workflows.",
   "license": "MIT",
@@ -24,6 +24,7 @@
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"node scripts/start-electron-dev.js\"",
     "icons": "python scripts/generate-icons.py",
+    "test": "node --test tests/*.test.js",
     "build": "vite build",
     "start": "node scripts/start-electron-built.js",
     "package:win": "npm run icons && npm run build && electron-builder --win portable",
