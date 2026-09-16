@@ -1,7 +1,16 @@
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const GAMEVIEWER_ADAPTER_NAME = 'GameViewer Virtual Display Adapter';
+const GAMEVIEWER_DISPLAY_CACHE_PATH = path.join(
+  process.env.ProgramData || 'C:\\ProgramData',
+  'Netease',
+  'GameViewer',
+  'cache_setting.ini'
+);
 const POWERSHELL_TIMEOUT_MS = 15000;
+const WINDOWS_DPI_SCALES = new Set([100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500]);
 
 const WINDOWS_DISPLAY_SOURCE = String.raw`
 using System;
@@ -23,6 +32,7 @@ public sealed class VirtualDisplayResult
     public int PositionY { get; set; }
     public int Orientation { get; set; }
     public int Scale { get; set; }
+    public int EffectiveScale { get; set; }
 }
 
 public static class VibeVirtualDisplay
@@ -32,7 +42,6 @@ public static class VibeVirtualDisplay
     private const int ENUM_CURRENT_SETTINGS = -1;
     private const int DISP_CHANGE_SUCCESSFUL = 0;
     private const int CDS_TEST = 0x2;
-    private const int CDS_RESET = 0x40000000;
     private const int DM_DISPLAYORIENTATION = 0x80;
     private const int DM_PELSWIDTH = 0x80000;
     private const int DM_PELSHEIGHT = 0x100000;
@@ -40,6 +49,7 @@ public static class VibeVirtualDisplay
     private const int DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
     private const int DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE = -3;
     private const int DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE = -4;
+    private const int MDT_EFFECTIVE_DPI = 0;
 
     private static readonly int[] DpiValues = new int[]
     {
@@ -91,6 +101,27 @@ public static class VibeVirtualDisplay
         public int dmPanningWidth;
         public int dmPanningHeight;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFOEX
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+
+    private delegate bool MonitorEnumProc(IntPtr monitor, IntPtr hdc, ref RECT rect, IntPtr data);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LUID
@@ -215,6 +246,18 @@ public static class VibeVirtualDisplay
     [DllImport("user32.dll", EntryPoint = "DisplayConfigSetDeviceInfo")]
     private static extern int DisplayConfigSetDpi(ref DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setPacket);
 
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clipRect, MonitorEnumProc callback, IntPtr data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFOEX info);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(IntPtr monitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
     public static VirtualDisplayResult GetStatus(string adapterName)
     {
         DISPLAY_DEVICE display;
@@ -237,26 +280,100 @@ public static class VibeVirtualDisplay
         result.PositionY = mode.dmPositionY;
         result.Orientation = mode.dmDisplayOrientation;
 
-        string dpiError;
-        int currentScale;
-        if (!TryGetDpi(display.DeviceName, out currentScale, out dpiError))
-        {
-            result.Ok = false;
-            result.Step = "scale";
-            result.Error = dpiError;
-            return result;
-        }
-
-        result.Scale = currentScale;
         return result;
     }
 
-    public static VirtualDisplayResult Apply(string adapterName, int baseWidth, int baseHeight, int orientation, int scale, bool forceMode)
+    public static VirtualDisplayResult GetConfiguredScale(string adapterName)
     {
         DISPLAY_DEVICE display;
         if (!TryFindVirtualDisplay(adapterName, out display))
         {
-            return NewResult(false, false, adapterName, "detect", "UU 虚拟屏未连接；已保留方向选择，连接后会自动应用。");
+            return NewResult(false, false, adapterName, "detect", "UU 虚拟屏未连接。");
+        }
+
+        string error;
+        int scale;
+        if (!TryGetDpi(display.DeviceName, out scale, out error))
+        {
+            return NewResult(false, true, adapterName, "scale-read", error);
+        }
+
+        VirtualDisplayResult result = GetStatus(adapterName);
+        result.Ok = true;
+        result.Step = "scale-status";
+        result.Error = "";
+        result.Scale = scale;
+        return result;
+    }
+
+    public static VirtualDisplayResult GetEffectiveScale(string adapterName)
+    {
+        DISPLAY_DEVICE display;
+        if (!TryFindVirtualDisplay(adapterName, out display))
+        {
+            return NewResult(false, false, adapterName, "detect", "UU 虚拟屏未连接。");
+        }
+
+        string error;
+        int scale;
+        if (!TryGetEffectiveDpi(display.DeviceName, out scale, out error))
+        {
+            return NewResult(false, true, adapterName, "effective-scale-read", error);
+        }
+
+        VirtualDisplayResult result = GetStatus(adapterName);
+        result.Ok = true;
+        result.Step = "effective-scale-status";
+        result.Error = "";
+        result.Scale = scale;
+        result.EffectiveScale = scale;
+        return result;
+    }
+
+    public static VirtualDisplayResult ReapplyScale(string adapterName, int desiredScale)
+    {
+        DISPLAY_DEVICE display;
+        if (!TryFindVirtualDisplay(adapterName, out display))
+        {
+            return NewResult(false, false, adapterName, "detect", "UU 虚拟屏未连接。");
+        }
+
+        string error;
+        if (!TrySetDpi(display.DeviceName, desiredScale, out error))
+        {
+            return NewResult(false, true, adapterName, "scale-apply", error);
+        }
+
+        Thread.Sleep(180);
+        int appliedScale;
+        if (!TryGetDpi(display.DeviceName, out appliedScale, out error))
+        {
+            return NewResult(false, true, adapterName, "scale-verify", error);
+        }
+
+        VirtualDisplayResult result = GetStatus(adapterName);
+        result.Scale = appliedScale;
+        result.Changed = true;
+        if (appliedScale != desiredScale)
+        {
+            result.Ok = false;
+            result.Step = "scale-verify";
+            result.Error = "UU 虚拟屏缩放未保持为 " + desiredScale + "% 。";
+            return result;
+        }
+
+        result.Ok = true;
+        result.Step = "scale";
+        result.Error = "";
+        return result;
+    }
+
+    public static VirtualDisplayResult Apply(string adapterName, int baseWidth, int baseHeight, int orientation)
+    {
+        DISPLAY_DEVICE display;
+        if (!TryFindVirtualDisplay(adapterName, out display))
+        {
+            return NewResult(false, false, adapterName, "detect", "UU 虚拟屏未连接，请连接后再选择方向。");
         }
 
         if (baseWidth <= 0 || baseHeight <= 0 || orientation < 0 || orientation > 3)
@@ -273,7 +390,7 @@ public static class VibeVirtualDisplay
         }
 
         bool changed = false;
-        if (forceMode || mode.dmPelsWidth != targetWidth || mode.dmPelsHeight != targetHeight || mode.dmDisplayOrientation != orientation)
+        if (mode.dmPelsWidth != targetWidth || mode.dmPelsHeight != targetHeight || mode.dmDisplayOrientation != orientation)
         {
             mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION;
             mode.dmPelsWidth = targetWidth;
@@ -286,7 +403,7 @@ public static class VibeVirtualDisplay
                 return NewResult(false, true, adapterName, "display-test", "UU 虚拟屏不支持所选分辨率或方向，测试返回 " + testResult + "。");
             }
 
-            int applyResult = ChangeDisplaySettingsEx(display.DeviceName, ref mode, IntPtr.Zero, forceMode ? CDS_RESET : 0, IntPtr.Zero);
+            int applyResult = ChangeDisplaySettingsEx(display.DeviceName, ref mode, IntPtr.Zero, 0, IntPtr.Zero);
             if (applyResult != DISP_CHANGE_SUCCESSFUL)
             {
                 return NewResult(false, true, adapterName, "display", "应用 UU 虚拟屏显示模式失败，返回 " + applyResult + "。");
@@ -294,38 +411,19 @@ public static class VibeVirtualDisplay
             changed = true;
         }
 
-        Thread.Sleep(450);
-        if (!TryFindVirtualDisplayWithRetry(adapterName, out display))
-        {
-            VirtualDisplayResult disconnected = NewResult(false, false, adapterName, "scale", "分辨率切换后 UU 虚拟屏暂时不可用。");
-            disconnected.Changed = changed;
-            return disconnected;
-        }
-
-        string dpiError;
-        if (!TrySetDpi(display.DeviceName, scale, out dpiError))
-        {
-            VirtualDisplayResult dpiFailure = GetStatus(adapterName);
-            dpiFailure.Ok = false;
-            dpiFailure.Step = "scale";
-            dpiFailure.Error = dpiError;
-            dpiFailure.Changed = changed;
-            return dpiFailure;
-        }
-
-        VirtualDisplayResult verified = WaitForExpected(adapterName, targetWidth, targetHeight, orientation, scale);
+        VirtualDisplayResult verified = WaitForExpected(adapterName, targetWidth, targetHeight, orientation);
         verified.Changed = changed || verified.Changed;
         return verified;
     }
 
-    private static VirtualDisplayResult WaitForExpected(string adapterName, int width, int height, int orientation, int scale)
+    private static VirtualDisplayResult WaitForExpected(string adapterName, int width, int height, int orientation)
     {
         VirtualDisplayResult latest = null;
         for (int attempt = 0; attempt < 6; attempt++)
         {
             Thread.Sleep(200);
             latest = GetStatus(adapterName);
-            if (latest.Ok && latest.Connected && latest.Width == width && latest.Height == height && latest.Orientation == orientation && latest.Scale == scale)
+            if (latest.Ok && latest.Connected && latest.Width == width && latest.Height == height && latest.Orientation == orientation)
             {
                 return latest;
             }
@@ -388,20 +486,6 @@ public static class VibeVirtualDisplay
             }
         }
         return found;
-    }
-
-    private static bool TryFindVirtualDisplayWithRetry(string adapterName, out DISPLAY_DEVICE selected)
-    {
-        for (int attempt = 0; attempt < 8; attempt++)
-        {
-            if (TryFindVirtualDisplay(adapterName, out selected))
-            {
-                return true;
-            }
-            Thread.Sleep(150);
-        }
-        selected = new DISPLAY_DEVICE();
-        return false;
     }
 
     private static bool TryGetCurrentMode(string deviceName, out DEVMODE mode)
@@ -471,7 +555,6 @@ public static class VibeVirtualDisplay
     private static bool TryGetDpi(string deviceName, out int currentScale, out string error)
     {
         currentScale = 0;
-        error = "";
         LUID adapterId;
         uint sourceId;
         if (!TryFindDisplaySource(deviceName, out adapterId, out sourceId, out error))
@@ -503,7 +586,7 @@ public static class VibeVirtualDisplay
         int desiredIndex = Array.IndexOf(DpiValues, desiredScale);
         if (desiredIndex < 0)
         {
-            error = "缩放比例必须是 Windows 支持的标准档位。";
+            error = "UU 配置中的缩放比例不是 Windows 支持的标准档位。";
             return false;
         }
 
@@ -525,14 +608,8 @@ public static class VibeVirtualDisplay
         int maximumIndex = recommendedIndex + current.maxScaleRel;
         if (desiredIndex < minimumIndex || desiredIndex > maximumIndex || maximumIndex >= DpiValues.Length)
         {
-            error = "UU 虚拟屏不支持 " + desiredScale + "% 缩放。";
+            error = "UU 虚拟屏不支持配置中的 " + desiredScale + "% 缩放。";
             return false;
-        }
-
-        int currentIndex = recommendedIndex + Math.Max(current.minScaleRel, Math.Min(current.curScaleRel, current.maxScaleRel));
-        if (currentIndex == desiredIndex)
-        {
-            return true;
         }
 
         DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setPacket = new DISPLAYCONFIG_SOURCE_DPI_SCALE_SET();
@@ -547,13 +624,71 @@ public static class VibeVirtualDisplay
             return false;
         }
 
+        // Re-submit even when the configured value already matches. UU can leave the
+        // display at a stale effective scale until Windows receives this notification.
         int setResult = DisplayConfigSetDpi(ref setPacket);
         if (setResult != 0)
         {
-            error = "设置 UU 虚拟屏缩放失败，返回 " + setResult + "。";
+            error = "重新应用 UU 虚拟屏缩放失败，返回 " + setResult + "。";
             return false;
         }
         return true;
+    }
+
+    private static bool TryGetEffectiveDpi(string deviceName, out int effectiveScale, out string error)
+    {
+        effectiveScale = 0;
+        error = "";
+        IntPtr previousContext = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try
+        {
+            bool found = false;
+            string callbackError = "";
+            int callbackScale = 0;
+            MonitorEnumProc callback = delegate(IntPtr monitor, IntPtr hdc, ref RECT rect, IntPtr data)
+            {
+                MONITORINFOEX info = new MONITORINFOEX();
+                info.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+                if (!GetMonitorInfo(monitor, ref info))
+                {
+                    return true;
+                }
+                if (!string.Equals(info.szDevice, deviceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                uint dpiX;
+                uint dpiY;
+                int dpiResult = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, out dpiX, out dpiY);
+                if (dpiResult != 0)
+                {
+                    callbackError = "读取 UU 虚拟屏有效 DPI 失败，返回 " + dpiResult + "。";
+                    return false;
+                }
+
+                callbackScale = (int)Math.Round(dpiX * 100.0 / 96.0);
+                found = true;
+                return false;
+            };
+
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero);
+            if (!found)
+            {
+                error = callbackError.Length > 0 ? callbackError : "未找到 UU 虚拟屏对应的活动监视器。";
+                return false;
+            }
+
+            effectiveScale = callbackScale;
+            return true;
+        }
+        finally
+        {
+            if (previousContext != IntPtr.Zero)
+            {
+                SetThreadDpiAwarenessContext(previousContext);
+            }
+        }
     }
 
     private static bool TryGetDpiPacket(LUID adapterId, uint sourceId, out DISPLAYCONFIG_SOURCE_DPI_SCALE_GET packet, out string error)
@@ -578,6 +713,7 @@ public static class VibeVirtualDisplay
         }
         return true;
     }
+
 }
 `;
 
@@ -602,7 +738,8 @@ function normalizeResult(value) {
     positionX: Number(result.PositionX) || 0,
     positionY: Number(result.PositionY) || 0,
     orientation: Number.isFinite(Number(result.Orientation)) ? Number(result.Orientation) : 0,
-    scale: Number(result.Scale) || 0
+    scale: Number(result.Scale) || 0,
+    effectiveScale: Number(result.EffectiveScale) || 0
   };
 }
 
@@ -679,7 +816,112 @@ function getVirtualDisplayStatus(adapterName = GAMEVIEWER_ADAPTER_NAME) {
   return invokeDisplayMethod('GetStatus', [adapterName]);
 }
 
-function applyVirtualDisplayProfile(profile, adapterName = GAMEVIEWER_ADAPTER_NAME, options = {}) {
+function getVirtualDisplayConfiguredScale(adapterName = GAMEVIEWER_ADAPTER_NAME) {
+  return invokeDisplayMethod('GetConfiguredScale', [adapterName]);
+}
+
+function getVirtualDisplayEffectiveScale(adapterName = GAMEVIEWER_ADAPTER_NAME) {
+  return invokeDisplayMethod('GetEffectiveScale', [adapterName]);
+}
+
+function reapplyVirtualDisplayScale(scale, adapterName = GAMEVIEWER_ADAPTER_NAME) {
+  return invokeDisplayMethod('ReapplyScale', [adapterName, Number(scale) || 0]);
+}
+
+function parseGameViewerDisplayCache(content) {
+  const entries = [];
+  let current;
+
+  for (const rawLine of String(content || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith(';') || line.startsWith('#')) continue;
+
+    const sectionMatch = line.match(/^\[([^\]]+)]$/);
+    if (sectionMatch) {
+      current = { section: sectionMatch[1] };
+      entries.push(current);
+      continue;
+    }
+
+    if (!current) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator).trim().toLowerCase();
+    current[key] = line.slice(separator + 1).trim();
+  }
+
+  return entries;
+}
+
+function normalizeDisplayDeviceName(value) {
+  return String(value || '').trim().replace(/\//g, '\\').toLowerCase();
+}
+
+function readGameViewerConfiguredScale(deviceName, options = {}) {
+  const cachePath = options.cachePath || GAMEVIEWER_DISPLAY_CACHE_PATH;
+  const normalizedDeviceName = normalizeDisplayDeviceName(deviceName);
+  if (!normalizedDeviceName) {
+    return { ok: false, step: 'scale-config', error: 'UU 虚拟屏设备名为空。', cachePath };
+  }
+
+  let content;
+  let modifiedAt = 0;
+  try {
+    content = fs.readFileSync(cachePath, 'utf8');
+    modifiedAt = fs.statSync(cachePath).mtimeMs;
+  } catch (error) {
+    return { ok: false, step: 'scale-config', error: `无法读取 UU 显示配置：${error.message}`, cachePath };
+  }
+
+  const entry = parseGameViewerDisplayCache(content).find((candidate) => (
+    normalizeDisplayDeviceName(candidate.device_name) === normalizedDeviceName
+  ));
+  if (!entry) {
+    return {
+      ok: false,
+      step: 'scale-config',
+      error: `UU 尚未写入 ${deviceName} 的显示配置。`,
+      cachePath,
+      modifiedAt
+    };
+  }
+
+  const scale = Number(entry.dpi_scale);
+  if (!WINDOWS_DPI_SCALES.has(scale)) {
+    return {
+      ok: false,
+      step: 'scale-config',
+      error: `UU 配置中的缩放比例无效：${entry.dpi_scale || '空'}。`,
+      cachePath,
+      modifiedAt,
+      entry
+    };
+  }
+
+  return {
+    ok: true,
+    step: 'scale-config',
+    cachePath,
+    modifiedAt,
+    deviceName: entry.device_name,
+    scale,
+    entry
+  };
+}
+
+function createOrientationDisplayProfile(preset, status) {
+  const width = Math.round(Number(status?.width) || 0);
+  const height = Math.round(Number(status?.height) || 0);
+  if (width <= 0 || height <= 0) return null;
+
+  return {
+    ...preset,
+    width: Math.max(width, height),
+    height: Math.min(width, height)
+  };
+}
+
+function applyVirtualDisplayProfile(profile, adapterName = GAMEVIEWER_ADAPTER_NAME) {
   const orientationCodes = {
     landscape: 0,
     portrait: 1,
@@ -690,165 +932,8 @@ function applyVirtualDisplayProfile(profile, adapterName = GAMEVIEWER_ADAPTER_NA
     adapterName,
     Number(profile.width) || 0,
     Number(profile.height) || 0,
-    orientationCodes[profile.orientation] ?? 1,
-    Number(profile.scale) || 0,
-    options.forceMode === true
+    orientationCodes[profile.orientation] ?? 1
   ]);
-}
-
-function orderVirtualDisplayProfileIndexes(profileCount, options = {}) {
-  const indexes = Array.from({ length: Math.max(0, Number(profileCount) || 0) }, (_, index) => index);
-  if (!indexes.length) return [];
-
-  const requestedIndex = indexes.includes(options.requestedIndex) ? options.requestedIndex : -1;
-  const rememberedIndex = options.preferSession !== false && indexes.includes(options.rememberedIndex)
-    ? options.rememberedIndex
-    : -1;
-  const firstIndex = requestedIndex >= 0 ? requestedIndex : (rememberedIndex >= 0 ? rememberedIndex : 0);
-  if (options.allowFallback === false) return [firstIndex];
-  return [firstIndex, ...indexes.filter((index) => index !== firstIndex)];
-}
-
-function oppositeDisplayOrientation(orientation) {
-  const opposites = {
-    landscape: 'portrait',
-    portrait: 'landscape',
-    'landscape-flipped': 'portrait-flipped',
-    'portrait-flipped': 'landscape-flipped'
-  };
-  return opposites[orientation] || 'landscape';
-}
-
-function createDisplayRefreshProfiles(profiles, candidateIndex) {
-  const candidate = profiles[candidateIndex];
-  if (!candidate) return [];
-
-  const otherProfiles = profiles.filter((_, index) => index !== candidateIndex);
-  const oppositeOrientation = oppositeDisplayOrientation(candidate.orientation);
-  const refreshProfiles = [
-    { ...candidate, orientation: oppositeOrientation },
-    ...otherProfiles.map((profile) => ({ ...profile, orientation: oppositeOrientation })),
-    ...otherProfiles
-  ];
-  const seen = new Set();
-
-  return refreshProfiles.filter((profile) => {
-    const key = [
-      Number(profile.width) || 0,
-      Number(profile.height) || 0,
-      Number(profile.scale) || 0,
-      profile.orientation
-    ].join(':');
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-async function refreshVirtualDisplayProfile(candidate, refreshProfiles, applyProfile, options = {}) {
-  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
-  const canContinue = typeof options.canContinue === 'function' ? options.canContinue : () => true;
-  const refreshAttempts = [];
-  let lastResult;
-
-  for (const refreshProfile of refreshProfiles) {
-    if (!isCurrent()) {
-      return { ok: false, stale: true, refreshAttempts };
-    }
-
-    const transitionResult = await applyProfile(refreshProfile, { transition: true });
-    refreshAttempts.push({
-      ...transitionResult,
-      profile: refreshProfile,
-      transition: true
-    });
-    lastResult = transitionResult;
-
-    if (!isCurrent()) {
-      return { ok: false, stale: true, refreshAttempts };
-    }
-    if (!transitionResult.ok) {
-      if (!canContinue(transitionResult)) break;
-      continue;
-    }
-
-    const targetResult = await applyProfile(candidate, { transition: false });
-    refreshAttempts.push({
-      ...targetResult,
-      profile: candidate,
-      transition: false
-    });
-    lastResult = targetResult;
-
-    if (!isCurrent()) {
-      return { ok: false, stale: true, refreshAttempts };
-    }
-    if (targetResult.ok) {
-      return {
-        ...targetResult,
-        refreshed: true,
-        refreshAttempts
-      };
-    }
-    if (!canContinue(targetResult)) break;
-  }
-
-  return {
-    ...(lastResult || {
-      ok: false,
-      connected: true,
-      step: 'display-refresh',
-      error: '没有可用于刷新 UU 虚拟屏的过渡显示模式。'
-    }),
-    ok: false,
-    refreshed: false,
-    refreshAttempts
-  };
-}
-
-async function applyVirtualDisplayCandidates(profiles, candidateIndexes, applyCandidate, options = {}) {
-  const indexes = Array.isArray(candidateIndexes) ? candidateIndexes : [];
-  const firstIndex = indexes[0] ?? -1;
-  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
-  const canContinue = typeof options.canContinue === 'function' ? options.canContinue : () => true;
-  const results = [];
-
-  for (const candidateIndex of indexes) {
-    if (!isCurrent()) {
-      return { ok: false, stale: true, results };
-    }
-
-    const candidate = profiles[candidateIndex];
-    const displayResult = await applyCandidate(candidate, candidateIndex);
-    results.push({
-      ...displayResult,
-      step: displayResult.step || 'display',
-      candidateIndex,
-      profile: candidate
-    });
-
-    if (!isCurrent()) {
-      return { ok: false, stale: true, results };
-    }
-
-    if (displayResult.ok) {
-      return {
-        ok: true,
-        preset: candidate,
-        candidateIndex,
-        results
-      };
-    }
-
-    if (!canContinue(displayResult, candidateIndex)) break;
-  }
-
-  return {
-    ok: false,
-    preset: firstIndex >= 0 ? profiles[firstIndex] : undefined,
-    candidateIndex: firstIndex,
-    results
-  };
 }
 
 function createLatestIntentQueue() {
@@ -883,11 +968,14 @@ function createLatestIntentQueue() {
 
 module.exports = {
   GAMEVIEWER_ADAPTER_NAME,
-  applyVirtualDisplayCandidates,
+  GAMEVIEWER_DISPLAY_CACHE_PATH,
   applyVirtualDisplayProfile,
-  createDisplayRefreshProfiles,
+  createOrientationDisplayProfile,
   createLatestIntentQueue,
+  getVirtualDisplayConfiguredScale,
+  getVirtualDisplayEffectiveScale,
   getVirtualDisplayStatus,
-  orderVirtualDisplayProfileIndexes,
-  refreshVirtualDisplayProfile
+  parseGameViewerDisplayCache,
+  readGameViewerConfiguredScale,
+  reapplyVirtualDisplayScale
 };

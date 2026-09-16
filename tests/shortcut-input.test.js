@@ -26,16 +26,30 @@ test('ordinary shortcuts retain their existing event sequence', () => {
   ]);
 });
 
+test('Ctrl+U produces a complete key down and key up chord', () => {
+  assert.deepEqual(shortcutToNativeEvents('Ctrl+U'), [
+    { vk: 0x11, up: false, extended: false },
+    { vk: 0x55, up: false, extended: false },
+    { vk: 0x55, up: true, extended: false },
+    { vk: 0x11, up: true, extended: false }
+  ]);
+});
+
 test('native sender is selected for Win and modifier-only shortcuts', () => {
   assert.equal(shortcutNeedsNativeSender('Ctrl+Win'), true);
   assert.equal(shortcutNeedsNativeSender('Ctrl+Alt'), true);
   assert.equal(shortcutNeedsNativeSender('Ctrl+I'), false);
 });
 
-test('Doubao RPC is selected only for its Ctrl+Win voice mode', () => {
+test('Doubao voice keeps its RPC route after changing the shortcut', () => {
   assert.equal(isDoubaoVoiceShortcut('Ctrl+Win', { kind: 'voice', label: '豆包' }), true);
   assert.equal(isDoubaoVoiceShortcut('Control+Meta', { kind: 'voice', label: 'Doubao Input' }), true);
   assert.equal(isDoubaoVoiceShortcut('Ctrl+Win', { kind: 'voice', label: '闪电说' }), false);
   assert.equal(isDoubaoVoiceShortcut('Ctrl+Win', { kind: 'button', label: '豆包' }), false);
-  assert.equal(isDoubaoVoiceShortcut('Ctrl+Win+Shift', { kind: 'voice', label: '豆包' }), false);
+  assert.equal(isDoubaoVoiceShortcut('Ctrl+U', { kind: 'voice', label: '豆包' }), true);
+  assert.equal(isDoubaoVoiceShortcut('Ctrl+Win+Shift', { kind: 'voice', label: '豆包' }), true);
+  assert.equal(isDoubaoVoiceShortcut('Ctrl+U', { kind: 'voice', label: '微信输入法' }), false);
+  assert.equal(isDoubaoVoiceShortcut('Ctrl+U', { kind: 'button', label: '豆包' }), false);
+  assert.equal(isDoubaoVoiceShortcut('', { kind: 'voice', label: '豆包' }), false);
+  assert.equal(isDoubaoVoiceShortcut('Ctrl+U', null), false);
 });

@@ -11,16 +11,11 @@ function shortcutNeedsNativeSender(shortcut) {
 }
 
 function isDoubaoVoiceShortcut(shortcut, context = {}) {
-  if (context.kind !== 'voice' || !/(?:豆包|doubao)/i.test(String(context.label || ''))) return false;
-
-  const parts = splitShortcut(shortcut).map((part) => {
-    const normalized = part.toLowerCase();
-    if (normalized === 'control') return 'ctrl';
-    if (normalized === 'meta' || normalized === 'cmd') return 'win';
-    return normalized;
-  });
-
-  return parts.length === 2 && parts.includes('ctrl') && parts.includes('win');
+  // Voice activation belongs to the selected provider, not its default hotkey.
+  // Custom shortcuts (e.g. Ctrl+U) need the same Doubao RPC path as Ctrl+Win.
+  return context?.kind === 'voice'
+    && /(?:豆包|doubao)/i.test(String(context.label || ''))
+    && splitShortcut(shortcut).length > 0;
 }
 
 function shortcutToNativeEvents(shortcut) {

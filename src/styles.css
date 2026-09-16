@@ -512,6 +512,30 @@ button {
   letter-spacing: 0;
 }
 
+.tool-shortcut-setting {
+  display: grid;
+  grid-template-columns: 36px minmax(120px, 1fr) minmax(180px, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.tool-shortcut-label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tool-shortcut-label strong {
+  color: #202b39;
+  font-size: 14px;
+}
+
+.tool-shortcut-label small {
+  color: #667486;
+  font-size: 12px;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -548,6 +572,20 @@ button {
   padding: 0;
   border: none;
   background: transparent;
+}
+
+.system-display-note {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #31516f;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.system-display-note svg {
+  flex: 0 0 auto;
 }
 
 .image-field button {

@@ -4,13 +4,14 @@ const fs = require('fs');
 const path = require('path');
 const {
   GAMEVIEWER_ADAPTER_NAME,
-  applyVirtualDisplayCandidates,
   applyVirtualDisplayProfile,
-  createDisplayRefreshProfiles,
+  createOrientationDisplayProfile,
   createLatestIntentQueue,
+  getVirtualDisplayConfiguredScale,
+  getVirtualDisplayEffectiveScale,
   getVirtualDisplayStatus,
-  orderVirtualDisplayProfileIndexes,
-  refreshVirtualDisplayProfile
+  readGameViewerConfiguredScale,
+  reapplyVirtualDisplayScale
 } = require('./virtual-display');
 const { GameViewerSessionWatcher } = require('./gameviewer-session');
 const {
@@ -28,28 +29,31 @@ const DEFAULT_PUNCTUATION_ITEMS = [
   { id: 'exclamation', label: '感叹号', text: '！' },
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
 ];
+const DEFAULT_PUNCTUATION_TOOLS = {
+  screenshot: {
+    id: 'screenshot',
+    label: '截图',
+    icon: 'ScanLine',
+    shortcut: 'Ctrl+Q'
+  }
+};
 const DEFAULT_DISPLAY_PRESETS = [
-  { id: 'preset-1', label: '设置一', width: 2000, height: 1200, scale: 200, orientation: 'portrait', target: 'gameviewer-virtual' },
-  { id: 'preset-2', label: '设置二', width: 2000, height: 1200, scale: 200, orientation: 'landscape', target: 'gameviewer-virtual' }
-];
-const VIRTUAL_DISPLAY_COMPATIBILITY_RESOLUTIONS = [
-  { width: 1920, height: 1200, mode: 'phone' }
+  { id: 'preset-1', label: '设置一', orientation: 'portrait', target: 'gameviewer-virtual' },
+  { id: 'preset-2', label: '设置二', orientation: 'landscape', target: 'gameviewer-virtual' }
 ];
 const DEFAULT_VIRTUAL_DISPLAY = {
   adapterName: GAMEVIEWER_ADAPTER_NAME,
-  autoRestore: true,
   lastOrientation: 'portrait',
   lastPresetId: 'preset-1'
 };
 const DEFAULT_REMOTE_AUTOMATION = {
+  refreshVirtualDisplayScale: true,
   resetFloatingWindow: true
 };
-const WM_DISPLAYCHANGE = 0x007E;
-const WM_DEVICECHANGE = 0x0219;
-const DBT_DEVNODES_CHANGED = 0x0007;
-
+const UU_SCALE_SETTLE_DELAY_MS = 4000;
+const UU_SCALE_VERIFY_DELAY_MS = 1800;
 const DEFAULT_CONFIG = {
-  schemaVersion: 7,
+  schemaVersion: 11,
   buttons: [
     {
       id: 'punctuation',
@@ -85,6 +89,7 @@ const DEFAULT_CONFIG = {
     }
   ],
   punctuationItems: DEFAULT_PUNCTUATION_ITEMS,
+  punctuationTools: DEFAULT_PUNCTUATION_TOOLS,
   displayPresets: DEFAULT_DISPLAY_PRESETS,
   virtualDisplay: DEFAULT_VIRTUAL_DISPLAY,
   remoteAutomation: DEFAULT_REMOTE_AUTOMATION,
@@ -126,22 +131,38 @@ let sideActionsOpen = false;
 let inputSenderProcess;
 let inputSenderBuffer = '';
 let inputSenderRequestId = 0;
-let virtualDisplayRestoreTimer;
-let virtualDisplayVerifyTimer;
-let virtualDisplayRestoreInProgress = false;
-let virtualDisplaySuppressUntil = 0;
-let virtualDisplaySessionResolution;
 const virtualDisplayIntent = createLatestIntentQueue();
 let virtualDisplayNativeOrigin;
 let gameViewerSessionConnected;
 let gameViewerSessionWatcher;
 let gameViewerSessionAutomationTimer;
-let nativeDisplayChangeAt = 0;
+let gameViewerSessionRevision = 0;
+let virtualDisplayConnectionSyncTimer;
+let virtualDisplayConnectionSyncRevision = 0;
+let displayAddedHandler;
+let displayRemovedHandler;
+let displayMetricsChangedHandler;
 let floatingResetTimer;
 const inputSenderPending = new Map();
 
 function configPath() {
   return path.join(app.getPath('userData'), 'config.json');
+}
+
+function displayAutomationLogPath() {
+  return path.join(app.getPath('userData'), 'display-automation.log');
+}
+
+function logDisplayAutomation(event, details = {}) {
+  try {
+    fs.appendFileSync(
+      displayAutomationLogPath(),
+      `${new Date().toISOString()} ${event} ${JSON.stringify(details)}\n`,
+      'utf8'
+    );
+  } catch {
+    // Diagnostics must never interrupt display recovery.
+  }
 }
 
 function mergeConfig(value) {
@@ -175,10 +196,18 @@ function mergeConfig(value) {
 
   next.buttons = ensureRequiredButtons(next.buttons);
   next.punctuationItems = mergePunctuationItems(rawValue.punctuationItems);
+  next.punctuationTools = mergePunctuationTools(rawValue.punctuationTools);
   next.displayPresets = mergeDisplayPresets(rawValue.displayPresets, rawSchemaVersion);
   next.virtualDisplay = mergeVirtualDisplay(rawValue.virtualDisplay, next.displayPresets);
   next.remoteAutomation = mergeRemoteAutomation(rawValue.remoteAutomation);
   next.voiceModes = mergeVoiceModes(rawValue.voiceModes, legacyVoiceButton, rawSchemaVersion);
+  next.voiceModes = reconcileVoiceButtonShortcut(next.voiceModes, legacyVoiceButton, rawSchemaVersion);
+  const activeVoiceMode = next.voiceModes.options[next.voiceModes.activeId];
+  next.buttons = next.buttons.map((button) => (
+    button.id === 'voice'
+      ? { ...button, shortcut: activeVoiceMode?.shortcut || '' }
+      : button
+  ));
   next.window.buttonSize = clamp(Number(next.window.buttonSize) || 64, 48, 112);
   next.window.gap = clamp(Number(next.window.gap) || 10, 4, 24);
   next.window.opacity = clamp(Number(next.window.opacity) || 0.78, 0.25, 1);
@@ -213,6 +242,25 @@ function mergePunctuationItems(value) {
     }));
 }
 
+function mergePunctuationTools(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const screenshot = source.screenshot && typeof source.screenshot === 'object'
+    ? source.screenshot
+    : {};
+  return {
+    screenshot: {
+      ...DEFAULT_PUNCTUATION_TOOLS.screenshot,
+      ...screenshot,
+      id: 'screenshot',
+      label: screenshot.label ? String(screenshot.label) : DEFAULT_PUNCTUATION_TOOLS.screenshot.label,
+      icon: screenshot.icon ? String(screenshot.icon) : DEFAULT_PUNCTUATION_TOOLS.screenshot.icon,
+      shortcut: Object.prototype.hasOwnProperty.call(screenshot, 'shortcut')
+        ? String(screenshot.shortcut)
+        : DEFAULT_PUNCTUATION_TOOLS.screenshot.shortcut
+    }
+  };
+}
+
 function mergeDisplayPresets(value, schemaVersion = DEFAULT_CONFIG.schemaVersion) {
   const source = Array.isArray(value) && value.length ? value : DEFAULT_DISPLAY_PRESETS;
   const presets = source
@@ -235,15 +283,6 @@ function normalizeDisplayPreset(value, index = 0, schemaVersion = DEFAULT_CONFIG
   return {
     id,
     label: preset.label ? String(preset.label) : `设置${index + 1}`,
-    width: migrateBuiltInPreset
-      ? fallback.width
-      : clamp(Math.round(Number(preset.width) || fallback.width), 320, 10000),
-    height: migrateBuiltInPreset
-      ? fallback.height
-      : clamp(Math.round(Number(preset.height) || fallback.height), 320, 10000),
-    scale: migrateBuiltInPreset
-      ? 200
-      : clamp(Math.round(Number(preset.scale) || fallback.scale), 100, 350),
     orientation,
     target: 'gameviewer-virtual'
   };
@@ -262,7 +301,6 @@ function mergeVirtualDisplay(value, displayPresets) {
 
   return {
     adapterName: GAMEVIEWER_ADAPTER_NAME,
-    autoRestore: source.autoRestore !== false,
     lastOrientation: matchingPreset?.orientation || lastOrientation,
     lastPresetId: matchingPreset?.id || DEFAULT_VIRTUAL_DISPLAY.lastPresetId
   };
@@ -271,6 +309,7 @@ function mergeVirtualDisplay(value, displayPresets) {
 function mergeRemoteAutomation(value) {
   const source = value && typeof value === 'object' ? value : {};
   return {
+    refreshVirtualDisplayScale: source.refreshVirtualDisplayScale !== false,
     resetFloatingWindow: source.resetFloatingWindow !== false
   };
 }
@@ -327,10 +366,46 @@ function mergeVoiceModes(value, legacyVoiceButton, schemaVersion) {
   return { activeId, options };
 }
 
+function reconcileVoiceButtonShortcut(voiceModes, legacyVoiceButton, schemaVersion) {
+  if (schemaVersion >= DEFAULT_CONFIG.schemaVersion) return voiceModes;
+
+  const legacyShortcut = String(legacyVoiceButton?.shortcut || '').trim();
+  if (!legacyShortcut) return voiceModes;
+
+  const normalizeShortcut = (value) => String(value || '').replace(/\s+/g, '').toLowerCase();
+  const legacyIdentity = normalizeShortcut(legacyShortcut);
+  const activeMode = voiceModes.options[voiceModes.activeId];
+  if (normalizeShortcut(activeMode?.shortcut) === legacyIdentity) return voiceModes;
+
+  const matchingMode = Object.values(voiceModes.options).find((mode) => (
+    normalizeShortcut(mode.shortcut) === legacyIdentity
+  ));
+  if (matchingMode) {
+    return { ...voiceModes, activeId: matchingMode.id };
+  }
+
+  return {
+    ...voiceModes,
+    options: {
+      ...voiceModes.options,
+      [voiceModes.activeId]: {
+        ...activeMode,
+        shortcut: legacyShortcut
+      }
+    }
+  };
+}
+
 function loadConfig() {
   try {
     const raw = fs.readFileSync(configPath(), 'utf8');
-    return mergeConfig(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const merged = mergeConfig(parsed);
+    if (Number(parsed.schemaVersion) !== DEFAULT_CONFIG.schemaVersion) {
+      fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+      fs.writeFileSync(configPath(), JSON.stringify(merged, null, 2), 'utf8');
+    }
+    return merged;
   } catch {
     return mergeConfig(DEFAULT_CONFIG);
   }
@@ -357,16 +432,6 @@ function saveConfig(nextConfig, options = {}) {
     updateFloatingWindowShape();
   }
   broadcastConfig();
-  if (
-    config.virtualDisplay.autoRestore
-    && gameViewerSessionConnected === true
-    && !options.skipVirtualDisplayRestore
-  ) {
-    scheduleVirtualDisplayRestore();
-  } else {
-    clearTimeout(virtualDisplayRestoreTimer);
-    clearTimeout(virtualDisplayVerifyTimer);
-  }
   return config;
 }
 
@@ -386,6 +451,10 @@ function virtualDisplayConfigSignature(targetConfig) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function floatingSize(open = true) {
@@ -493,26 +562,6 @@ function createFloatingWindow() {
       sandbox: false
     }
   });
-
-  if (process.platform === 'win32') {
-    floatingWindow.hookWindowMessage(WM_DISPLAYCHANGE, () => {
-      if (Date.now() < virtualDisplaySuppressUntil) return;
-      nativeDisplayChangeAt = Date.now();
-      scheduleVirtualDisplayRestoreForActiveSession(3000);
-    });
-    floatingWindow.hookWindowMessage(WM_DEVICECHANGE, (wParam) => {
-      const eventType = Buffer.isBuffer(wParam) && wParam.length >= 4
-        ? wParam.readUInt32LE(0)
-        : Number(wParam);
-      const followsDisplayChange = Date.now() - nativeDisplayChangeAt < 7000;
-      if (
-        eventType !== DBT_DEVNODES_CHANGED
-        || !followsDisplayChange
-        || Date.now() < virtualDisplaySuppressUntil
-      ) return;
-      scheduleVirtualDisplayRestoreForActiveSession(1200);
-    });
-  }
 
   floatingWindow.setAlwaysOnTop(true, 'screen-saver');
   updateFloatingWindowShape();
@@ -714,7 +763,7 @@ function displayPresetMenuLabel(preset, index) {
     'landscape-flipped': '横向翻转',
     'portrait-flipped': '纵向翻转'
   }[normalized.orientation] || normalized.orientation;
-  return `${normalized.label} · ${orientationText} · ${normalized.width}×${normalized.height} · ${normalized.scale}%`;
+  return `${normalized.label} · ${orientationText} · 跟随系统`;
 }
 
 function broadcastConfig() {
@@ -1243,52 +1292,30 @@ async function sendShortcutSequence(shortcuts) {
 async function applyDisplayPresetFromTray(preset) {
   const intentRevision = beginVirtualDisplayIntent();
   const normalized = rememberVirtualDisplayPreset(preset, {
-    preserveVirtualDisplayIntent: true,
-    skipVirtualDisplayRestore: true
+    preserveVirtualDisplayIntent: true
   });
-  const result = await applyDisplayPreset(normalized, {
-    preferSession: false,
-    forceMode: true,
-    roundTripIfMatching: true,
-    intentRevision
-  });
+  const result = await applyDisplayPreset(normalized, { intentRevision });
   if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return result;
   const failedStep = [...result.results].reverse().find((step) => !step.ok);
   const waitingForConnection = !result.ok && failedStep?.step === 'detect' && !failedStep.connected;
   const appliedPreset = result.preset || normalized;
   const appliedDimensions = effectiveDisplayDimensions(appliedPreset);
-  const compatibilityText = result.candidateIndex > 0 ? '（手机兼容模式）' : '';
 
   if (result.ok && config.remoteAutomation.resetFloatingWindow) {
     scheduleFloatingWindowReset(800);
   }
 
-  if (result.ok && config.virtualDisplay.autoRestore) {
-    clearTimeout(virtualDisplayVerifyTimer);
-    virtualDisplayVerifyTimer = setTimeout(
-      () => verifyVirtualDisplayRestore({
-        requestedPreset: normalized,
-        appliedPreset,
-        candidateIndex: result.candidateIndex,
-        retryCount: 0,
-        forceMode: true,
-        intentRevision
-      }),
-      3200
-    );
-  }
-
   if (tray && typeof tray.displayBalloon === 'function') {
     tray.displayBalloon({
-      title: waitingForConnection ? '已记住虚拟屏方向' : (result.ok ? '已应用 UU 虚拟屏预设' : 'UU 虚拟屏预设未完全应用'),
+      title: waitingForConnection ? 'UU 虚拟屏未连接' : (result.ok ? '已切换 UU 虚拟屏方向' : 'UU 虚拟屏方向切换失败'),
       content: waitingForConnection
-        ? 'UU 虚拟屏连接后会自动应用该方向。'
+        ? '连接 UU 虚拟屏后，请再次点击该方向。'
         : result.ok
-          ? `${appliedDimensions.width} × ${appliedDimensions.height}、${appliedPreset.scale}% ${compatibilityText}已应用到 UU 虚拟屏。`
-        : failedStep?.error || '请检查当前屏幕是否支持该分辨率或方向。'
+          ? `${appliedDimensions.width} × ${appliedDimensions.height}，沿用系统当前像素尺寸与缩放。`
+          : failedStep?.error || '请检查当前虚拟屏是否支持该方向。'
     });
   } else if (!result.ok && !waitingForConnection) {
-    dialog.showErrorBox('UU 虚拟屏预设未完全应用', failedStep?.error || '请检查当前虚拟屏是否支持该分辨率或方向。');
+    dialog.showErrorBox('UU 虚拟屏方向切换失败', failedStep?.error || '请检查当前虚拟屏是否支持该方向。');
   }
 
   return result;
@@ -1311,42 +1338,7 @@ function rememberVirtualDisplayPreset(preset, saveOptions = {}) {
   return config.displayPresets.find((item) => item.id === normalized.id) || normalized;
 }
 
-function compatibleDisplayProfiles(preset) {
-  const normalized = normalizeDisplayPreset(preset);
-  const profiles = [normalized];
-  if (normalized.width === 2000 && normalized.height === 1200) {
-    for (const resolution of VIRTUAL_DISPLAY_COMPATIBILITY_RESOLUTIONS) {
-      profiles.push({
-        ...normalized,
-        width: resolution.width,
-        height: resolution.height,
-        compatibilityMode: resolution.mode
-      });
-    }
-  }
-  return profiles;
-}
-
-function sessionCandidateIndex(profiles) {
-  if (!virtualDisplaySessionResolution) return -1;
-  return profiles.findIndex((profile) => (
-    profile.width === virtualDisplaySessionResolution.width
-    && profile.height === virtualDisplaySessionResolution.height
-  ));
-}
-
-function canTryCompatibleProfile(result) {
-  return Boolean(
-    result.connected
-    && ['display-test', 'display', 'verify'].includes(result.step)
-  );
-}
-
 function beginVirtualDisplayIntent() {
-  clearTimeout(virtualDisplayRestoreTimer);
-  virtualDisplayRestoreTimer = undefined;
-  clearTimeout(virtualDisplayVerifyTimer);
-  virtualDisplayVerifyTimer = undefined;
   return virtualDisplayIntent.begin();
 }
 
@@ -1361,105 +1353,53 @@ function applyDisplayPreset(preset, options = {}) {
 }
 
 async function applyDisplayPresetNow(preset, options = {}) {
-  const profiles = compatibleDisplayProfiles(preset);
-  const requestedIndex = Number.isInteger(options.candidateIndex)
-    ? clamp(options.candidateIndex, 0, profiles.length - 1)
-    : -1;
-  const rememberedIndex = options.preferSession === false ? -1 : sessionCandidateIndex(profiles);
-  const candidateIndexes = orderVirtualDisplayProfileIndexes(profiles.length, {
-    requestedIndex,
-    rememberedIndex,
-    preferSession: options.preferSession,
-    allowFallback: options.allowFallback
-  });
-  const firstIndex = candidateIndexes[0];
-  const result = await applyVirtualDisplayCandidates(
-    profiles,
-    candidateIndexes,
-    async (candidate, candidateIndex) => {
-      const applyProfile = async (profile) => {
-        virtualDisplaySuppressUntil = Date.now() + 12000;
-        return rememberVirtualDisplayStatus(
-          await applyVirtualDisplayProfile(profile, config.virtualDisplay.adapterName, {
-            forceMode: true
-          })
-        );
-      };
-
-      if (options.roundTripIfMatching) {
-        const currentStatus = await readVirtualDisplayStatus();
-        if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
-          return { ok: false, stale: true };
-        }
-        if (displayStatusMatchesPreset(currentStatus, candidate)) {
-          return refreshVirtualDisplayProfile(
-            candidate,
-            createDisplayRefreshProfiles(profiles, candidateIndex),
-            applyProfile,
-            {
-              isCurrent: () => virtualDisplayIntent.isCurrent(options.intentRevision),
-              canContinue: canTryCompatibleProfile
-            }
-          );
-        }
-      }
-
-      virtualDisplaySuppressUntil = Date.now() + 5000;
-      return rememberVirtualDisplayStatus(
-        await applyVirtualDisplayProfile(candidate, config.virtualDisplay.adapterName, {
-          forceMode: options.forceMode === true
-        })
-      );
-    },
-    {
-      isCurrent: () => virtualDisplayIntent.isCurrent(options.intentRevision),
-      canContinue: (displayResult) => (
-        options.allowFallback !== false && canTryCompatibleProfile(displayResult)
-      )
-    }
-  );
-
-  if (result.ok) {
-    virtualDisplaySessionResolution = {
-      width: result.preset.width,
-      height: result.preset.height,
-      deviceName: result.results.at(-1)?.deviceName || ''
+  const normalized = normalizeDisplayPreset(preset);
+  const status = options.sourceStatus || await readVirtualDisplayStatus();
+  if (!virtualDisplayIntent.isCurrent(options.intentRevision)) {
+    return { ok: false, stale: true, results: [] };
+  }
+  if (!status.connected) {
+    return {
+      ok: false,
+      preset: normalized,
+      candidateIndex: 0,
+      results: [{
+        ...status,
+        ok: false,
+        step: 'detect',
+        error: status.error || 'UU 虚拟屏未连接，请连接后再选择方向。'
+      }]
     };
   }
 
-  return result.candidateIndex >= 0
-    ? result
-    : { ...result, preset: profiles[firstIndex], candidateIndex: firstIndex };
-}
+  const orientationProfile = createOrientationDisplayProfile(normalized, status);
+  if (!orientationProfile) {
+    return {
+      ok: false,
+      preset: normalized,
+      candidateIndex: 0,
+      results: [{
+        ...status,
+        ok: false,
+        step: 'display',
+        error: '无法从 UU 虚拟屏读取当前设备的有效分辨率。'
+      }]
+    };
+  }
 
-function getAutoRestorePreset() {
-  const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
-    ? config.displayPresets
-    : DEFAULT_DISPLAY_PRESETS;
-  return presets.find((preset) => preset.id === config.virtualDisplay.lastPresetId)
-    || presets.find((preset) => preset.orientation === config.virtualDisplay.lastOrientation)
-    || presets[0];
-}
-
-function displayStatusMatchesPreset(status, preset) {
-  const orientationCodes = {
-    landscape: 0,
-    portrait: 1,
-    'landscape-flipped': 2,
-    'portrait-flipped': 3
-  };
-  const orientation = orientationCodes[preset.orientation] ?? 1;
-  const portrait = orientation % 2 === 1;
-  const expectedWidth = portrait ? preset.height : preset.width;
-  const expectedHeight = portrait ? preset.width : preset.height;
-  return Boolean(
-    status.connected
-    && status.ok
-    && status.width === expectedWidth
-    && status.height === expectedHeight
-    && status.orientation === orientation
-    && status.scale === preset.scale
+  const displayResult = rememberVirtualDisplayStatus(
+    await applyVirtualDisplayProfile(orientationProfile, config.virtualDisplay.adapterName)
   );
+  return {
+    ok: displayResult.ok,
+    preset: orientationProfile,
+    candidateIndex: 0,
+    results: [{
+      ...displayResult,
+      profile: orientationProfile,
+      candidateIndex: 0
+    }]
+  };
 }
 
 function effectiveDisplayDimensions(preset) {
@@ -1468,117 +1408,6 @@ function effectiveDisplayDimensions(preset) {
     width: portrait ? preset.height : preset.width,
     height: portrait ? preset.width : preset.height
   };
-}
-
-function scheduleVirtualDisplayRestore(delay = 1500) {
-  if (!config?.virtualDisplay?.autoRestore) return;
-  if (Date.now() < virtualDisplaySuppressUntil) return;
-  clearTimeout(virtualDisplayRestoreTimer);
-  virtualDisplayRestoreTimer = setTimeout(() => {
-    virtualDisplayRestoreTimer = undefined;
-    runVirtualDisplayRestore();
-  }, delay);
-}
-
-function scheduleVirtualDisplayRestoreForActiveSession(delay) {
-  if (gameViewerSessionConnected !== true) return;
-  scheduleVirtualDisplayRestore(delay);
-}
-
-async function runVirtualDisplayRestore(context = {}) {
-  if (virtualDisplayRestoreInProgress || !config?.virtualDisplay?.autoRestore) return;
-  if (Date.now() < virtualDisplaySuppressUntil) return;
-  const intentRevision = Number.isInteger(context.intentRevision)
-    ? context.intentRevision
-    : virtualDisplayIntent.current();
-  if (!virtualDisplayIntent.isCurrent(intentRevision)) return;
-  virtualDisplayRestoreInProgress = true;
-  try {
-    const requestedPreset = context.requestedPreset || getAutoRestorePreset();
-    const profiles = compatibleDisplayProfiles(requestedPreset);
-    const preferSession = context.preferSession !== false;
-    const rememberedIndex = preferSession ? sessionCandidateIndex(profiles) : -1;
-    const candidateIndex = Number.isInteger(context.candidateIndex)
-      ? clamp(context.candidateIndex, 0, profiles.length - 1)
-      : (rememberedIndex >= 0 ? rememberedIndex : 0);
-    const expectedPreset = profiles[candidateIndex];
-    const status = await readVirtualDisplayStatus();
-    if (!virtualDisplayIntent.isCurrent(intentRevision)) return;
-    if (!status.connected) {
-      virtualDisplaySessionResolution = undefined;
-      return;
-    }
-    if (displayStatusMatchesPreset(status, expectedPreset) && !context.forceMode) return;
-
-    const result = await applyDisplayPreset(requestedPreset, {
-      candidateIndex: Number.isInteger(context.candidateIndex) ? candidateIndex : undefined,
-      preferSession,
-      forceMode: context.forceMode === true,
-      allowFallback: !Number.isInteger(context.candidateIndex) || candidateIndex < profiles.length - 1,
-      roundTripIfMatching: context.roundTripIfMatching === true,
-      intentRevision
-    });
-    if (result.stale || !virtualDisplayIntent.isCurrent(intentRevision)) return;
-    if (!result.ok) {
-      notifyVirtualDisplayFailure(result.results.at(-1)?.error);
-      return;
-    }
-
-    clearTimeout(virtualDisplayVerifyTimer);
-    virtualDisplayVerifyTimer = setTimeout(
-      () => verifyVirtualDisplayRestore({
-        requestedPreset,
-        appliedPreset: result.preset,
-        candidateIndex: result.candidateIndex,
-        forceMode: context.forceMode === true,
-        roundTripIfMatching: context.roundTripIfMatching === true,
-        intentRevision,
-        retryCount: result.candidateIndex === candidateIndex
-          ? (Number(context.retryCount) || 0)
-          : 0
-      }),
-      3200
-    );
-  } finally {
-    virtualDisplayRestoreInProgress = false;
-  }
-}
-
-async function verifyVirtualDisplayRestore(context) {
-  if (!config?.virtualDisplay?.autoRestore) return;
-  if (!virtualDisplayIntent.isCurrent(context.intentRevision)) return;
-  const status = await readVirtualDisplayStatus();
-  if (!virtualDisplayIntent.isCurrent(context.intentRevision)) return;
-  if (!status.connected) {
-    virtualDisplaySessionResolution = undefined;
-    return;
-  }
-  if (displayStatusMatchesPreset(status, context.appliedPreset)) return;
-
-  if (context.retryCount < 1) {
-    await runVirtualDisplayRestore({
-      requestedPreset: context.requestedPreset,
-      candidateIndex: context.candidateIndex,
-      forceMode: context.forceMode === true,
-      roundTripIfMatching: context.roundTripIfMatching === true,
-      retryCount: context.retryCount + 1,
-      intentRevision: context.intentRevision
-    });
-    return;
-  }
-
-  notifyVirtualDisplayFailure('UU 再次覆盖了目标分辨率；将在下次显示变化时重新尝试。');
-}
-
-function notifyVirtualDisplayFailure(message) {
-  const content = message || '请检查 UU 虚拟屏是否支持该分辨率、方向和缩放比例。';
-  if (tray && typeof tray.displayBalloon === 'function') {
-    tray.displayBalloon({ title: 'UU 虚拟屏自动恢复失败', content });
-  }
-}
-
-function wait(delayMs) {
-  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function rememberVirtualDisplayStatus(status) {
@@ -1599,57 +1428,320 @@ async function readVirtualDisplayStatus() {
   );
 }
 
-async function applyRemoteSessionAutomation(connected, options = {}) {
-  const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
+async function waitForConnectedVirtualDisplay(isCurrent) {
+  let status;
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    if (!isCurrent()) return { ok: false, stale: true, step: 'scale-refresh' };
+    status = await readVirtualDisplayStatus();
+    if (status.connected && status.deviceName) return status;
+    if (attempt < 6) await delay(300);
+  }
+  return status || {
+    ok: false,
+    connected: false,
+    step: 'detect',
+    error: 'UU 会话已连接，但尚未检测到虚拟屏。'
+  };
+}
 
-  if (connected && config.virtualDisplay.autoRestore) {
-    clearTimeout(virtualDisplayRestoreTimer);
-    virtualDisplayRestoreTimer = undefined;
-    while (virtualDisplayRestoreInProgress) await wait(150);
-    if (Date.now() < virtualDisplaySuppressUntil) {
-      await wait(virtualDisplaySuppressUntil - Date.now() + 100);
+async function readUuTargetScale(status, isCurrent) {
+  let cacheResult;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (!isCurrent()) return { ok: false, stale: true, step: 'scale-config' };
+    cacheResult = readGameViewerConfiguredScale(status.deviceName);
+    if (cacheResult.ok) {
+      return { ...cacheResult, source: 'uu-cache' };
     }
-    await runVirtualDisplayRestore({
-      preferSession: options.connectionChanged || options.entrySync ? false : undefined,
-      forceMode: Boolean(options.connectionChanged || options.entrySync),
-      roundTripIfMatching: Boolean(options.connectionChanged || options.entrySync),
-      intentRevision: options.intentRevision
+    if (attempt < 3) await delay(250);
+  }
+
+  if (!isCurrent()) return { ok: false, stale: true, step: 'scale-config' };
+  const displayResult = await getVirtualDisplayConfiguredScale(config.virtualDisplay.adapterName);
+  if (!displayResult.ok) return cacheResult || displayResult;
+  return {
+    ...displayResult,
+    source: 'display-config',
+    scale: displayResult.scale
+  };
+}
+
+async function refreshUuVirtualDisplayScale(sessionRevision) {
+  const isCurrent = () => (
+    gameViewerSessionConnected === true
+    && sessionRevision === gameViewerSessionRevision
+  );
+  const status = await waitForConnectedVirtualDisplay(isCurrent);
+  if (!status.connected || status.stale) return status;
+
+  const target = await readUuTargetScale(status, isCurrent);
+  if (!target.ok || target.stale || !isCurrent()) return target;
+
+  logDisplayAutomation('scale-target', {
+    sessionRevision,
+    deviceName: status.deviceName,
+    width: status.width,
+    height: status.height,
+    targetScale: target.scale,
+    source: target.source
+  });
+
+  // UU finishes its display/capture initialization after Windows announces the
+  // monitor. Applying before that point only changes the scale briefly.
+  await delay(UU_SCALE_SETTLE_DELAY_MS);
+  if (!isCurrent()) return { ok: false, stale: true, step: 'scale-settle' };
+
+  const firstResult = rememberVirtualDisplayStatus(
+    await reapplyVirtualDisplayScale(target.scale, config.virtualDisplay.adapterName)
+  );
+  logDisplayAutomation('scale-reapply', {
+    sessionRevision,
+    attempt: 1,
+    targetScale: target.scale,
+    result: firstResult
+  });
+  if (!firstResult.ok || !isCurrent()) {
+    return {
+      ...firstResult,
+      requestedScale: target.scale,
+      scaleSource: target.source
+    };
+  }
+
+  await delay(UU_SCALE_VERIFY_DELAY_MS);
+  if (!isCurrent()) return { ok: false, stale: true, step: 'scale-verify' };
+
+  let effectiveResult = await getVirtualDisplayEffectiveScale(config.virtualDisplay.adapterName);
+  logDisplayAutomation('scale-effective-verify', {
+    sessionRevision,
+    attempt: 1,
+    targetScale: target.scale,
+    result: effectiveResult
+  });
+
+  let result = firstResult;
+  if (!effectiveResult.ok || effectiveResult.scale !== target.scale) {
+    result = rememberVirtualDisplayStatus(
+      await reapplyVirtualDisplayScale(target.scale, config.virtualDisplay.adapterName)
+    );
+    logDisplayAutomation('scale-reapply', {
+      sessionRevision,
+      attempt: 2,
+      targetScale: target.scale,
+      result
+    });
+    if (!result.ok || !isCurrent()) {
+      return {
+        ...result,
+        requestedScale: target.scale,
+        scaleSource: target.source
+      };
+    }
+
+    await delay(450);
+    if (!isCurrent()) return { ok: false, stale: true, step: 'scale-verify' };
+    effectiveResult = await getVirtualDisplayEffectiveScale(config.virtualDisplay.adapterName);
+    logDisplayAutomation('scale-effective-verify', {
+      sessionRevision,
+      attempt: 2,
+      targetScale: target.scale,
+      result: effectiveResult
     });
   }
 
+  if (!effectiveResult.ok || effectiveResult.scale !== target.scale) {
+    return {
+      ...effectiveResult,
+      ok: false,
+      step: 'effective-scale-verify',
+      error: effectiveResult.error || `UU 虚拟屏实际缩放未保持为 ${target.scale}%。`,
+      requestedScale: target.scale,
+      scaleSource: target.source
+    };
+  }
+
+  return {
+    ...result,
+    effectiveScale: effectiveResult.scale,
+    requestedScale: target.scale,
+    scaleSource: target.source
+  };
+}
+
+function notifyScaleRefreshFailure(result) {
+  if (!result || result.stale || !gameViewerSessionConnected) return;
+  const message = result.error || '无法读取或重新应用 UU 虚拟屏的缩放配置。';
+  if (tray && typeof tray.displayBalloon === 'function') {
+    tray.displayBalloon({
+      title: 'UU 虚拟屏缩放刷新失败',
+      content: message
+    });
+  }
+}
+
+async function applyRemoteSessionAutomation(connected, options = {}) {
+  const automation = config.remoteAutomation || DEFAULT_REMOTE_AUTOMATION;
+  const sessionRevision = options.sessionRevision ?? gameViewerSessionRevision;
+
+  if (sessionRevision !== gameViewerSessionRevision) return;
+
+  if (connected) {
+    const result = automation.refreshVirtualDisplayScale
+      ? await refreshUuVirtualDisplayScale(sessionRevision)
+      : await readVirtualDisplayStatus();
+    if (automation.refreshVirtualDisplayScale && !result.ok) {
+      notifyScaleRefreshFailure(result);
+    }
+  } else {
+    virtualDisplayNativeOrigin = undefined;
+  }
+
+  if (sessionRevision !== gameViewerSessionRevision) return;
   if ((options.connectionChanged || options.entrySync) && automation.resetFloatingWindow) {
     scheduleFloatingWindowReset(800);
   }
 }
 
-function scheduleGameViewerSessionAutomation(connected) {
+function scheduleGameViewerSessionAutomation(connected, options = {}) {
+  const connectionChanged = gameViewerSessionConnected !== connected;
   gameViewerSessionConnected = connected;
+  gameViewerSessionRevision += 1;
+  const sessionRevision = gameViewerSessionRevision;
   clearTimeout(gameViewerSessionAutomationTimer);
-  const intentRevision = beginVirtualDisplayIntent();
+  beginVirtualDisplayIntent();
+  logDisplayAutomation('session-scheduled', {
+    connected,
+    connectionChanged,
+    reason: options.reason || 'session-event',
+    sessionRevision
+  });
   gameViewerSessionAutomationTimer = setTimeout(() => {
     gameViewerSessionAutomationTimer = undefined;
     applyRemoteSessionAutomation(connected, {
-      connectionChanged: true,
-      entrySync: connected,
-      intentRevision
-    }).catch((error) => notifyVirtualDisplayFailure(error.message));
+      connectionChanged,
+      entrySync: options.entrySync ?? (connectionChanged && connected),
+      sessionRevision
+    }).catch(() => undefined);
   }, connected ? 700 : 250);
 }
 
 function registerGameViewerSessionAutomation() {
   gameViewerSessionWatcher = new GameViewerSessionWatcher({
-    onSessionChanged: ({ connected }) => scheduleGameViewerSessionAutomation(connected)
+    onSessionChanged: ({ connected }) => scheduleGameViewerSessionAutomation(connected, {
+      reason: 'uu-session-log'
+    })
   }).start();
 }
 
-function registerVirtualDisplayAutomation() {
-  const schedule = () => {
-    if (Date.now() < virtualDisplaySuppressUntil) return;
-    scheduleVirtualDisplayRestoreForActiveSession(1800);
+function scheduleVirtualDisplayConnectionSync(options = {}) {
+  const revision = virtualDisplayConnectionSyncRevision + 1;
+  virtualDisplayConnectionSyncRevision = revision;
+  clearTimeout(virtualDisplayConnectionSyncTimer);
+  virtualDisplayConnectionSyncTimer = setTimeout(async () => {
+    virtualDisplayConnectionSyncTimer = undefined;
+    let status;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (revision !== virtualDisplayConnectionSyncRevision) return;
+      status = await getVirtualDisplayStatus(config.virtualDisplay.adapterName);
+      if (status.connected) break;
+      if (attempt < 3) await delay(250);
+    }
+
+    if (revision !== virtualDisplayConnectionSyncRevision || !status) return;
+    if (status.connected) {
+      rememberVirtualDisplayStatus(status);
+      if (gameViewerSessionConnected !== true) {
+        scheduleGameViewerSessionAutomation(true, {
+          reason: options.reason || 'display-connected'
+        });
+        return;
+      }
+
+      if (options.checkScale && config.remoteAutomation?.refreshVirtualDisplayScale) {
+        const [configuredScale, effectiveScale] = await Promise.all([
+          getVirtualDisplayConfiguredScale(config.virtualDisplay.adapterName),
+          getVirtualDisplayEffectiveScale(config.virtualDisplay.adapterName)
+        ]);
+        if (revision !== virtualDisplayConnectionSyncRevision) return;
+
+        logDisplayAutomation('topology-scale-check', {
+          reason: options.reason || 'display-event',
+          deviceName: status.deviceName,
+          configuredScale: configuredScale.scale,
+          effectiveScale: effectiveScale.scale,
+          configuredOk: configuredScale.ok,
+          effectiveOk: effectiveScale.ok
+        });
+
+        if (
+          configuredScale.ok
+          && effectiveScale.ok
+          && configuredScale.scale !== effectiveScale.scale
+        ) {
+          scheduleGameViewerSessionAutomation(true, {
+            entrySync: false,
+            reason: 'effective-scale-mismatch'
+          });
+        }
+      }
+      return;
+    }
+
+    if (gameViewerSessionConnected === true) {
+      scheduleGameViewerSessionAutomation(false, {
+        reason: options.reason || 'display-disconnected'
+      });
+    }
+  }, Number(options.delay) || 500);
+}
+
+function registerVirtualDisplayConnectionEvents() {
+  displayAddedHandler = (_event, display) => {
+    logDisplayAutomation('display-added', { display });
+    scheduleVirtualDisplayConnectionSync({
+      checkScale: true,
+      delay: 500,
+      reason: 'display-added'
+    });
   };
-  screen.on('display-added', schedule);
-  screen.on('display-metrics-changed', schedule);
-  screen.on('display-removed', schedule);
+  displayRemovedHandler = (_event, display) => {
+    logDisplayAutomation('display-removed', { display });
+    scheduleVirtualDisplayConnectionSync({
+      checkScale: true,
+      delay: 500,
+      reason: 'display-removed'
+    });
+  };
+  displayMetricsChangedHandler = (_event, display, changedMetrics) => {
+    logDisplayAutomation('display-metrics-changed', { display, changedMetrics });
+    scheduleVirtualDisplayConnectionSync({
+      checkScale: true,
+      delay: 500,
+      reason: 'display-metrics-changed'
+    });
+  };
+  screen.on('display-added', displayAddedHandler);
+  screen.on('display-removed', displayRemovedHandler);
+  screen.on('display-metrics-changed', displayMetricsChangedHandler);
+
+  // A one-time startup sync covers launching Vibe Shortcut during an active UU session.
+  scheduleVirtualDisplayConnectionSync({
+    checkScale: true,
+    delay: 500
+  });
+  logDisplayAutomation('startup-sync-scheduled');
+}
+
+function unregisterVirtualDisplayConnectionEvents() {
+  clearTimeout(virtualDisplayConnectionSyncTimer);
+  virtualDisplayConnectionSyncTimer = undefined;
+  virtualDisplayConnectionSyncRevision += 1;
+  if (displayAddedHandler) screen.removeListener('display-added', displayAddedHandler);
+  if (displayRemovedHandler) screen.removeListener('display-removed', displayRemovedHandler);
+  if (displayMetricsChangedHandler) screen.removeListener('display-metrics-changed', displayMetricsChangedHandler);
+  displayAddedHandler = undefined;
+  displayRemovedHandler = undefined;
+  displayMetricsChangedHandler = undefined;
 }
 
 function startRepeatShortcut(shortcut) {
@@ -1745,7 +1837,26 @@ function broadcastStartup(state = getStartupState()) {
 function registerIpc() {
   ipcMain.handle('config:get', () => config);
   ipcMain.handle('config:save', (_event, nextConfig, options) => saveConfig(nextConfig, options));
-  ipcMain.handle('shortcut:send', (_event, shortcut, context) => sendShortcut(shortcut, context));
+  ipcMain.handle('shortcut:send', async (_event, shortcut, context) => {
+    let result;
+    try {
+      result = await sendShortcut(shortcut, context);
+    } catch (error) {
+      result = { ok: false, error: error.message };
+    }
+    if (context?.kind === 'voice') {
+      try {
+        fs.appendFileSync(path.join(app.getPath('userData'), 'voice-input.log'),
+          `${new Date().toISOString()} ${JSON.stringify({ shortcut, modeId: context.modeId, label: context.label, ...result })}\n`, 'utf8');
+      } catch {
+        // Diagnostics must not interrupt input.
+      }
+      if (!result.ok && tray && typeof tray.displayBalloon === 'function') {
+        tray.displayBalloon({ title: '语音输入启动失败', content: result.error || '请检查当前语音模式及输入法。' });
+      }
+    }
+    return result;
+  });
   ipcMain.handle('shortcut:sendSequence', (_event, shortcuts) => sendShortcutSequence(shortcuts));
   ipcMain.handle('text:send', (_event, text, afterShortcut) => sendText(text, afterShortcut));
   ipcMain.handle('text:insert', (_event, text, afterShortcut) => sendText(text, afterShortcut));
@@ -1793,11 +1904,6 @@ if (!gotSingleInstanceLock) {
     if (config.remoteAutomation.resetFloatingWindow) {
       scheduleFloatingWindowReset(100);
     }
-    if (gameViewerSessionConnected === true) {
-      applyDisplayPresetFromTray(getAutoRestorePreset()).catch((error) => {
-        notifyVirtualDisplayFailure(error.message);
-      });
-    }
   });
 
   app.whenReady().then(() => {
@@ -1808,7 +1914,7 @@ if (!gotSingleInstanceLock) {
     createTray();
     ensureInputSender();
     registerGameViewerSessionAutomation();
-    registerVirtualDisplayAutomation();
+    registerVirtualDisplayConnectionEvents();
 
     app.on('activate', () => {
       if (!floatingWindow) createFloatingWindow();
@@ -1816,11 +1922,10 @@ if (!gotSingleInstanceLock) {
   });
 
   app.on('before-quit', () => {
-    clearTimeout(virtualDisplayRestoreTimer);
-    clearTimeout(virtualDisplayVerifyTimer);
     clearTimeout(gameViewerSessionAutomationTimer);
     clearTimeout(floatingResetTimer);
     gameViewerSessionWatcher?.dispose();
+    unregisterVirtualDisplayConnectionEvents();
     stopInputSender();
   });
 

@@ -2,141 +2,36 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
-  applyVirtualDisplayCandidates,
-  createDisplayRefreshProfiles,
-  createLatestIntentQueue,
-  orderVirtualDisplayProfileIndexes,
-  refreshVirtualDisplayProfile
+  createOrientationDisplayProfile,
+  createLatestIntentQueue
 } = require('../electron/virtual-display');
 
-test('manual preset selection starts with the configured resolution', () => {
+test('orientation profile keeps the connected device dimensions', () => {
+  const preset = { id: 'portrait', orientation: 'portrait' };
   assert.deepEqual(
-    orderVirtualDisplayProfileIndexes(2, {
-      rememberedIndex: 1,
-      preferSession: false,
-      allowFallback: true
-    }),
-    [0, 1]
-  );
-});
-
-test('automatic restore can reuse the compatible session resolution', () => {
-  assert.deepEqual(
-    orderVirtualDisplayProfileIndexes(2, {
-      rememberedIndex: 1,
-      preferSession: true,
-      allowFallback: true
-    }),
-    [1, 0]
-  );
-});
-
-test('an explicit retry candidate remains authoritative', () => {
-  assert.deepEqual(
-    orderVirtualDisplayProfileIndexes(3, {
-      requestedIndex: 2,
-      rememberedIndex: 1,
-      preferSession: true,
-      allowFallback: false
-    }),
-    [2]
-  );
-});
-
-test('same-orientation restore falls back once without an unsupported priming pulse', async () => {
-  const profiles = [
-    { width: 2000, height: 1200, orientation: 'portrait' },
-    { width: 1920, height: 1200, orientation: 'portrait' }
-  ];
-  const applied = [];
-
-  const result = await applyVirtualDisplayCandidates(
-    profiles,
-    [0, 1],
-    async (profile, candidateIndex) => {
-      applied.push(candidateIndex);
-      return candidateIndex === 0
-        ? { ok: false, connected: true, step: 'display-test', error: 'DISP_CHANGE_BADMODE' }
-        : { ok: true, connected: true, step: 'status', changed: true };
-    },
+    createOrientationDisplayProfile(preset, { width: 1080, height: 2400 }),
     {
-      canContinue: (displayResult) => displayResult.connected
+      id: 'portrait',
+      orientation: 'portrait',
+      width: 2400,
+      height: 1080
     }
   );
-
-  assert.equal(result.ok, true);
-  assert.equal(result.candidateIndex, 1);
-  assert.equal(result.preset, profiles[1]);
-  assert.deepEqual(applied, [0, 1]);
-  assert.equal(result.results.length, 2);
 });
 
-test('matching preset refreshes through the opposite orientation and returns to target', async () => {
-  const profiles = [
-    { width: 2000, height: 1200, scale: 200, orientation: 'landscape' },
-    { width: 1920, height: 1200, scale: 200, orientation: 'landscape' }
-  ];
-  const refreshProfiles = createDisplayRefreshProfiles(profiles, 0);
-  assert.deepEqual(
-    refreshProfiles.map((profile) => [profile.width, profile.height, profile.orientation]),
-    [
-      [2000, 1200, 'portrait'],
-      [1920, 1200, 'portrait'],
-      [1920, 1200, 'landscape']
-    ]
+test('orientation profile normalizes a landscape device without changing its dimensions', () => {
+  const profile = createOrientationDisplayProfile(
+    { id: 'landscape', orientation: 'landscape' },
+    { width: 2504, height: 2312 }
   );
 
-  const applied = [];
-  const result = await refreshVirtualDisplayProfile(
-    profiles[0],
-    refreshProfiles,
-    async (profile, phase) => {
-      applied.push([profile.width, profile.height, profile.orientation, phase.transition]);
-      return { ok: true, connected: true, step: 'status', changed: true };
-    },
-    {
-      canContinue: () => true
-    }
-  );
-
-  assert.equal(result.ok, true);
-  assert.equal(result.refreshed, true);
-  assert.deepEqual(applied, [
-    [2000, 1200, 'portrait', true],
-    [2000, 1200, 'landscape', false]
-  ]);
+  assert.equal(profile.width, 2504);
+  assert.equal(profile.height, 2312);
+  assert.equal(profile.orientation, 'landscape');
 });
 
-test('matching fallback retries a supported opposite-orientation transition', async () => {
-  const profiles = [
-    { width: 2000, height: 1200, scale: 200, orientation: 'portrait' },
-    { width: 1920, height: 1200, scale: 200, orientation: 'portrait' }
-  ];
-  const refreshProfiles = createDisplayRefreshProfiles(profiles, 1);
-  const applied = [];
-  const result = await refreshVirtualDisplayProfile(
-    profiles[1],
-    refreshProfiles,
-    async (profile, phase) => {
-      applied.push([profile.width, profile.orientation, phase.transition]);
-      if (profile.width === 1920 && profile.orientation === 'landscape') {
-        return { ok: true, connected: true, step: 'status' };
-      }
-      if (!phase.transition && profile.width === 1920 && profile.orientation === 'portrait') {
-        return { ok: true, connected: true, step: 'status' };
-      }
-      return { ok: false, connected: true, step: 'display-test', error: 'BADMODE' };
-    },
-    {
-      canContinue: (displayResult) => displayResult.step === 'display-test'
-    }
-  );
-
-  assert.equal(result.ok, true);
-  assert.deepEqual(applied, [
-    [1920, 'landscape', true],
-    [1920, 'portrait', false]
-  ]);
+test('orientation profile rejects a missing display size', () => {
+  assert.equal(createOrientationDisplayProfile({ orientation: 'portrait' }, { width: 0, height: 0 }), null);
 });
 
 test('a delayed stale callback cannot overwrite the latest display intent', async () => {

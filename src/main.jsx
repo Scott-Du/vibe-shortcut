@@ -14,6 +14,14 @@ const PUNCTUATION_TOOL_ITEMS = [
   { id: 'paste', label: '粘贴', icon: 'Clipboard', shortcut: 'Ctrl+V' },
   { id: 'cut', label: '剪切', icon: 'Scissors', shortcut: 'Ctrl+X' }
 ];
+const defaultPunctuationTools = {
+  screenshot: {
+    id: 'screenshot',
+    label: '截图',
+    icon: 'ScanLine',
+    shortcut: 'Ctrl+Q'
+  }
+};
 const defaultPunctuationItems = [
   { id: 'comma', label: '逗号', text: '，' },
   { id: 'period', label: '句号', text: '。' },
@@ -21,16 +29,16 @@ const defaultPunctuationItems = [
   { id: 'quote', label: '中文引号', text: '「」', afterShortcut: 'Left' }
 ];
 const defaultDisplayPresets = [
-  { id: 'preset-1', label: '设置一', width: 2000, height: 1200, scale: 200, orientation: 'portrait', target: 'gameviewer-virtual' },
-  { id: 'preset-2', label: '设置二', width: 2000, height: 1200, scale: 200, orientation: 'landscape', target: 'gameviewer-virtual' }
+  { id: 'preset-1', label: '设置一', orientation: 'portrait', target: 'gameviewer-virtual' },
+  { id: 'preset-2', label: '设置二', orientation: 'landscape', target: 'gameviewer-virtual' }
 ];
 const defaultVirtualDisplay = {
   adapterName: 'GameViewer Virtual Display Adapter',
-  autoRestore: true,
   lastOrientation: 'portrait',
   lastPresetId: 'preset-1'
 };
 const defaultRemoteAutomation = {
+  refreshVirtualDisplayScale: true,
   resetFloatingWindow: true
 };
 const SETTINGS_SECTIONS = [
@@ -103,7 +111,7 @@ const defaultVoiceModes = {
 };
 
 const previewConfig = {
-  schemaVersion: 7,
+  schemaVersion: 11,
   buttons: [
     { id: 'punctuation', label: '标点', iconType: 'lucide', icon: 'Braces', image: '', shortcut: '' },
     { id: 'voice', label: '语音', iconType: 'lucide', icon: 'Mic', image: '', shortcut: 'Ctrl+I' },
@@ -111,6 +119,7 @@ const previewConfig = {
     { id: 'delete', label: '删除', iconType: 'lucide', icon: 'Delete', image: '', shortcut: 'Backspace' }
   ],
   punctuationItems: defaultPunctuationItems,
+  punctuationTools: defaultPunctuationTools,
   displayPresets: defaultDisplayPresets,
   virtualDisplay: defaultVirtualDisplay,
   remoteAutomation: defaultRemoteAutomation,
@@ -172,6 +181,12 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function waitForPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+  });
+}
+
 function FloatingPanel() {
   const [config, setConfig] = useConfig();
   const [activeId, setActiveId] = useState(null);
@@ -217,7 +232,7 @@ function FloatingPanel() {
     setDeleteHeadArmed(false);
 
     if (nextType) {
-      api.setSideActionsOpen(true).finally(() => {
+      return api.setSideActionsOpen(true).finally(() => {
         if (sideActionRequestRef.current !== requestId) return;
         window.requestAnimationFrame(() => {
           if (sideActionRequestRef.current === requestId) {
@@ -229,10 +244,17 @@ function FloatingPanel() {
     }
 
     setSideActionTypeState(null);
-    window.requestAnimationFrame(() => {
-      if (sideActionRequestRef.current === requestId) {
-        api.setSideActionsOpen(false);
-      }
+    return new Promise((resolve) => {
+      window.requestAnimationFrame(() => {
+        if (sideActionRequestRef.current !== requestId) {
+          resolve();
+          return;
+        }
+
+        Promise.resolve(api.setSideActionsOpen(false))
+          .catch(() => {})
+          .finally(resolve);
+      });
     });
   }
 
@@ -279,6 +301,13 @@ function FloatingPanel() {
 
   async function triggerPunctuationTool(tool) {
     pulse(`punctuation:${tool.id}`);
+
+    if (tool.id === 'screenshot') {
+      await setSideActionType(null);
+      await waitForPaint();
+      await sleep(40);
+    }
+
     await api.sendShortcut(tool.shortcut);
   }
 
@@ -537,7 +566,7 @@ function FloatingPanel() {
       return (
         <div className="side-action-column punctuation-panel" onPointerDown={(event) => event.stopPropagation()}>
           <div className="punctuation-tool-column">
-            {PUNCTUATION_TOOL_ITEMS.map((tool) => {
+            {getPunctuationToolItems(config).map((tool) => {
               const ToolIcon = Icons[tool.icon] || Icons.Circle;
               return (
                 <button
@@ -669,6 +698,8 @@ function SettingsApp() {
         updateVoiceMode(recordingId.replace('voice:', ''), { shortcut });
       } else if (recordingId.startsWith('button:')) {
         updateButton(recordingId.replace('button:', ''), { shortcut });
+      } else if (recordingId === 'tool:screenshot') {
+        updateScreenshotTool({ shortcut });
       }
       setRecordingId(null);
     };
@@ -710,8 +741,8 @@ function SettingsApp() {
   const buttons = Array.isArray(draft.buttons) ? draft.buttons : [];
   const voiceModes = getVoiceModes(draft);
   const punctuationItems = getEditablePunctuationItems(draft);
+  const punctuationTools = getPunctuationTools(draft);
   const displayPresets = getEditableDisplayPresets(draft);
-  const virtualDisplay = getVirtualDisplay(draft);
   const remoteAutomation = getRemoteAutomation(draft);
 
   function commitDraft(updater, options) {
@@ -755,6 +786,7 @@ function SettingsApp() {
         ...current,
         voiceModes: {
           ...currentVoiceModes,
+          activeId: Object.prototype.hasOwnProperty.call(patch, 'shortcut') ? id : currentVoiceModes.activeId,
           options: {
             ...currentVoiceModes.options,
             [id]: {
@@ -842,6 +874,19 @@ function SettingsApp() {
     }));
   }
 
+  function updateScreenshotTool(patch) {
+    commitDraft((current) => ({
+      ...current,
+      punctuationTools: {
+        ...getPunctuationTools(current),
+        screenshot: {
+          ...getPunctuationTools(current).screenshot,
+          ...patch
+        }
+      }
+    }), { preserveFloatingBounds: true });
+  }
+
   function removePunctuationItem(id) {
     if (punctuationItems.length <= 1) return;
     commitDraft((current) => ({
@@ -864,7 +909,7 @@ function SettingsApp() {
       ...current,
       displayPresets: [
         ...getEditableDisplayPresets(current),
-        { id, label: `设置${index}`, width: 2000, height: 1200, scale: 200, orientation: 'landscape', target: 'gameviewer-virtual' }
+        { id, label: `设置${index}`, orientation: 'landscape', target: 'gameviewer-virtual' }
       ]
     }));
   }
@@ -876,16 +921,6 @@ function SettingsApp() {
         preset.id === id ? { ...preset, ...patch } : preset
       ))
     }));
-  }
-
-  function setVirtualDisplayPatch(patch) {
-    commitDraft((current) => ({
-      ...current,
-      virtualDisplay: {
-        ...getVirtualDisplay(current),
-        ...patch
-      }
-    }), { preserveFloatingBounds: true });
   }
 
   function setRemoteAutomationPatch(patch) {
@@ -1080,20 +1115,22 @@ function SettingsApp() {
                     </div>
                   )}
 
-                  <label className="field">
-                    <span>快捷键</span>
-                    <div className="inline-recorder">
-                      <strong>{shortcutLabelForButton(button, draft)}</strong>
-                      <button
-                        ref={recording ? recorderRef : null}
-                        type="button"
-                        className={recording ? 'is-recording' : ''}
-                        onClick={() => setRecordingId(`button:${button.id}`)}
-                      >
-                        {recording ? '按键中' : '录制'}
-                      </button>
-                    </div>
-                  </label>
+                  {!isVoiceButton(button) && (
+                    <label className="field">
+                      <span>快捷键</span>
+                      <div className="inline-recorder">
+                        <strong>{shortcutLabelForButton(button, draft)}</strong>
+                        <button
+                          ref={recording ? recorderRef : null}
+                          type="button"
+                          className={recording ? 'is-recording' : ''}
+                          onClick={() => setRecordingId(`button:${button.id}`)}
+                        >
+                          {recording ? '按键中' : '录制'}
+                        </button>
+                      </div>
+                    </label>
+                  )}
                 </div>
               </div>
             );
@@ -1109,7 +1146,7 @@ function SettingsApp() {
         <div className="section-heading">
           <div>
             <h2>语音</h2>
-            <p>语音输入法模式</p>
+            <p>当前使用：{getActiveVoiceMode(draft).label} · {getActiveVoiceMode(draft).shortcut || '未设置'}</p>
           </div>
         </div>
 
@@ -1130,6 +1167,12 @@ function SettingsApp() {
                 </button>
 
                 <div className="voice-mode-fields">
+                  <div className="field-row">
+                    <button type="button" disabled={selected} onClick={() => setActiveVoiceMode(modeId)}>
+                      {selected ? '当前使用' : '使用此模式'}
+                    </button>
+                    <span>录制快捷键后自动使用此模式</span>
+                  </div>
                   <div className="field-row">
                     <label className="field">
                       <span>名称</span>
@@ -1190,6 +1233,7 @@ function SettingsApp() {
   }
 
   function renderPunctuationSection() {
+    const screenshotRecording = recordingId === 'tool:screenshot';
     return (
       <div className="settings-section-page">
         <div className="section-heading">
@@ -1200,6 +1244,27 @@ function SettingsApp() {
           <button className="small-icon-button" type="button" onClick={addPunctuationItem} title="新增标点">
             <Icons.Plus size={17} />
           </button>
+        </div>
+
+        <div className="form-section">
+          <div className="tool-shortcut-setting">
+            <span className="button-list-icon"><Icons.ScanLine size={18} /></span>
+            <span className="tool-shortcut-label">
+              <strong>截图</strong>
+              <small>显示在复制、粘贴、剪切下方</small>
+            </span>
+            <div className="inline-recorder">
+              <strong>{punctuationTools.screenshot.shortcut || '未设置'}</strong>
+              <button
+                ref={screenshotRecording ? recorderRef : null}
+                type="button"
+                className={screenshotRecording ? 'is-recording' : ''}
+                onClick={() => setRecordingId('tool:screenshot')}
+              >
+                {screenshotRecording ? '按键中' : '录制'}
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="punctuation-config-list">
@@ -1328,23 +1393,23 @@ function SettingsApp() {
             <span>
               <strong>UU 虚拟屏</strong>
               <small>仅操作 GameViewer Virtual Display Adapter</small>
-              <small>自动兼容 2000×1200 / 1920×1200</small>
+              <small>分辨率跟随 UU；连接后可重放 UU 当前缩放</small>
             </span>
           </div>
-          <label className="switch-field">
-            <span>
-              <strong>连接后自动恢复</strong>
-              <small>恢复上次选择的方向，不修改物理屏</small>
-            </span>
-            <input
-              type="checkbox"
-              checked={virtualDisplay.autoRestore}
-              onChange={(event) => setVirtualDisplayPatch({ autoRestore: event.target.checked })}
-            />
-          </label>
         </div>
 
         <div className="form-section remote-automation-section">
+          <label className="switch-field">
+            <span>
+              <strong>连接后刷新 UU 缩放</strong>
+              <small>读取本次设备的 UU 缩放配置并重新应用，不固定比例</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={remoteAutomation.refreshVirtualDisplayScale}
+              onChange={(event) => setRemoteAutomationPatch({ refreshVirtualDisplayScale: event.target.checked })}
+            />
+          </label>
           <label className="switch-field">
             <span>
               <strong>恢复悬浮窗默认位置</strong>
@@ -1398,36 +1463,9 @@ function SettingsApp() {
                 </label>
               </div>
 
-              <div className="field-row three-columns">
-                <label className="field">
-                  <span>缩放</span>
-                  <select
-                    value={preset.scale}
-                    onChange={(event) => updateDisplayPreset(preset.id, { scale: Number(event.target.value) })}
-                  >
-                    {[100, 125, 150, 175, 200, 225, 250, 300, 350].map((scale) => (
-                      <option key={scale} value={scale}>{scale}%</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>宽度</span>
-                  <input
-                    type="number"
-                    min="320"
-                    value={preset.width}
-                    onChange={(event) => updateDisplayPreset(preset.id, { width: Number(event.target.value) })}
-                  />
-                </label>
-                <label className="field">
-                  <span>高度</span>
-                  <input
-                    type="number"
-                    min="320"
-                    value={preset.height}
-                    onChange={(event) => updateDisplayPreset(preset.id, { height: Number(event.target.value) })}
-                  />
-                </label>
+              <div className="system-display-note">
+                <Icons.Info size={15} />
+                <span>手动点击预设时只切换方向，沿用系统当前像素尺寸与缩放。</span>
               </div>
             </div>
           ))}
@@ -1609,6 +1647,29 @@ function getEditablePunctuationItems(config) {
   }));
 }
 
+function getPunctuationTools(config) {
+  const source = config.punctuationTools && typeof config.punctuationTools === 'object'
+    ? config.punctuationTools
+    : {};
+  const screenshot = source.screenshot && typeof source.screenshot === 'object'
+    ? source.screenshot
+    : {};
+  return {
+    screenshot: {
+      ...defaultPunctuationTools.screenshot,
+      ...screenshot,
+      id: 'screenshot'
+    }
+  };
+}
+
+function getPunctuationToolItems(config) {
+  return [
+    ...PUNCTUATION_TOOL_ITEMS,
+    getPunctuationTools(config).screenshot
+  ];
+}
+
 function getEditableDisplayPresets(config) {
   const presets = Array.isArray(config.displayPresets) && config.displayPresets.length
     ? config.displayPresets
@@ -1619,9 +1680,6 @@ function getEditableDisplayPresets(config) {
     return {
       id: preset.id || `preset-${index + 1}`,
       label: preset.label || `设置${index + 1}`,
-      width: Number.isFinite(Number(preset.width)) ? Number(preset.width) : fallback.width,
-      height: Number.isFinite(Number(preset.height)) ? Number(preset.height) : fallback.height,
-      scale: Number.isFinite(Number(preset.scale)) ? Number(preset.scale) : fallback.scale,
       orientation: ['landscape', 'portrait', 'landscape-flipped', 'portrait-flipped'].includes(preset.orientation)
         ? preset.orientation
         : fallback.orientation,
@@ -1630,23 +1688,12 @@ function getEditableDisplayPresets(config) {
   });
 }
 
-function getVirtualDisplay(config) {
-  const source = config.virtualDisplay && typeof config.virtualDisplay === 'object'
-    ? config.virtualDisplay
-    : defaultVirtualDisplay;
-  return {
-    adapterName: 'GameViewer Virtual Display Adapter',
-    autoRestore: source.autoRestore !== false,
-    lastOrientation: source.lastOrientation || defaultVirtualDisplay.lastOrientation,
-    lastPresetId: source.lastPresetId || defaultVirtualDisplay.lastPresetId
-  };
-}
-
 function getRemoteAutomation(config) {
   const source = config.remoteAutomation && typeof config.remoteAutomation === 'object'
     ? config.remoteAutomation
     : defaultRemoteAutomation;
   return {
+    refreshVirtualDisplayScale: source.refreshVirtualDisplayScale !== false,
     resetFloatingWindow: source.resetFloatingWindow !== false
   };
 }
